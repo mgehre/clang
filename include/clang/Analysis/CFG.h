@@ -57,6 +57,7 @@ public:
     Statement,
     Initializer,
     NewAllocator,
+    AutomaticObjLeavesScope,
     // dtor kind
     AutomaticObjectDtor,
     DeleteDtor,
@@ -163,6 +164,27 @@ private:
   CFGNewAllocator() {}
   static bool isKind(const CFGElement &elem) {
     return elem.getKind() == NewAllocator;
+  }
+};
+
+class CFGAutomaticObjLeavesScope : public CFGElement {
+public:
+  explicit CFGAutomaticObjLeavesScope(const VarDecl *var, const Stmt *stmt)
+    : CFGElement(AutomaticObjLeavesScope, var, stmt) {}
+
+  const VarDecl *getVarDecl() const {
+    return static_cast<VarDecl*>(Data1.getPointer());
+  }
+
+  const Stmt *getTriggerStmt() const {
+    return static_cast<Stmt*>(Data2.getPointer());
+  }
+
+private:
+  friend class CFGElement;
+  CFGAutomaticObjLeavesScope() {}
+  static bool isKind(const CFGElement &elem) {
+    return elem.getKind() == AutomaticObjLeavesScope;
   }
 };
 
@@ -682,6 +704,10 @@ public:
     Elements.push_back(CFGAutomaticObjDtor(VD, S), C);
   }
 
+  void appendAutomaticObjLeavesScope(VarDecl *VD, Stmt *S, BumpVectorContext &C) {
+    Elements.push_back(CFGAutomaticObjLeavesScope(VD, S), C);
+  }
+
   void appendDeleteDtor(CXXRecordDecl *RD, CXXDeleteExpr *DE, BumpVectorContext &C) {
     Elements.push_back(CFGDeleteDtor(RD, DE), C);
   }
@@ -696,6 +722,19 @@ public:
   }
   iterator insertAutomaticObjDtor(iterator I, VarDecl *VD, Stmt *S) {
     *I = CFGAutomaticObjDtor(VD, S);
+    return ++I;
+  }
+
+  // Scope leaving must be performed in reversed order. So insertion is in two
+  // steps. First we prepare space for some number of elements, then we insert
+  // the elements beginning at the last position in prepared space.
+  iterator beginAutomaticObjLeavesScopeInsert(iterator I, size_t Cnt,
+      BumpVectorContext &C) {
+    return iterator(Elements.insert(I.base(), Cnt,
+                                    CFGAutomaticObjLeavesScope(nullptr, nullptr), C));
+  }
+  iterator insertAutomaticObjLeavesScope(iterator I, VarDecl *VD, Stmt *S) {
+    *I = CFGAutomaticObjLeavesScope(VD, S);
     return ++I;
   }
 };
@@ -731,6 +770,7 @@ public:
     ForcedBlkExprs **forcedBlkExprs;
     CFGCallback *Observer;
     bool PruneTriviallyFalseEdges;
+    bool AddAutomaticObjLeavesScope;
     bool AddEHEdges;
     bool AddInitializers;
     bool AddImplicitDtors;
@@ -755,7 +795,9 @@ public:
 
     BuildOptions()
       : forcedBlkExprs(nullptr), Observer(nullptr),
-        PruneTriviallyFalseEdges(true), AddEHEdges(false),
+        PruneTriviallyFalseEdges(true),
+        AddAutomaticObjLeavesScope(false),
+        AddEHEdges(false),
         AddInitializers(false), AddImplicitDtors(false),
         AddTemporaryDtors(false), AddStaticInitBranches(false),
         AddCXXNewAllocator(false), AddCXXDefaultInitExprInCtors(false) {}

@@ -334,6 +334,12 @@ struct Variable {
     return getType().getCanonicalType()->isPointerType();
   }
 
+  bool isCategoryPointer() const {
+    if (isThisPointer())
+      return true;
+    return classifyTypeCategory(getType()) == TypeCategory::Pointer;
+  }
+
   // If FDs is empty, Var must be of class type and
   // FD must be a field within that class type.
   // If FDs is not empty, FDs.back() must be of class type
@@ -729,7 +735,7 @@ class PSetsBuilder {
 
   // Returns the variable which the expression refers to,
   // or None.
-  Optional<Variable> refersTo(const Expr *E) {
+  Variable refersTo(const Expr *E) {
     E = E->IgnoreParenCasts();
     switch (E->getStmtClass()) {
     case Expr::DeclRefExprClass: {
@@ -737,7 +743,7 @@ class PSetsBuilder {
       auto *VD = dyn_cast<VarDecl>(DeclRef->getDecl());
       if (VD)
         return Variable(VD);
-      return {};
+      return Variable::temporary();
     }
 
     case Expr::CXXThisExprClass: {
@@ -747,25 +753,25 @@ class PSetsBuilder {
     case Expr::MemberExprClass: {
       const auto *M = cast<MemberExpr>(E);
       auto SubV = refersTo(M->getBase());
-      if (!SubV)
-        return {};
 
       /// The returned declaration will be a FieldDecl or (in C++) a VarDecl
       /// (for static data members), a CXXMethodDecl, or an EnumConstantDecl.
       auto *FD = dyn_cast<FieldDecl>(M->getMemberDecl());
       if (FD) {
-        SubV->addFieldRef(FD);
+        SubV.addFieldRef(FD);
         return SubV;
       }
-      return {};
+      return Variable::temporary();
     }
     default:
-      return {};
+      return Variable::temporary();
     }
   }
 
   // Evaluate the given expression for all effects on psets of variables
   void EvalExpr(const Expr *E) {
+    llvm::errs() << "EvalExpr\n";
+        E->dump();
     E = E->IgnoreParenCasts();
 
     switch (E->getStmtClass()) {
@@ -774,26 +780,25 @@ class PSetsBuilder {
       if (BinOp->getOpcode() == BO_Assign) {
         EvalExpr(BinOp->getLHS()); // Eval for side-effects
         auto Category = classifyTypeCategory(BinOp->getLHS()->getType());
-        Optional<Variable> V = refersTo(BinOp->getLHS());
-        if (Category == TypeCategory::Owner && V) {
+        Variable V = refersTo(BinOp->getLHS());
+        if (Category == TypeCategory::Owner) {
           // When an Owner x is copied to or moved to, set pset(x) = {x'}
-          SetPSet(*V, PSet::pointsToVariable(*V, 1), BinOp->getExprLoc());
-        } else if (Category == TypeCategory::Pointer && V) {
+          SetPSet(V, PSet::pointsToVariable(V, 1), BinOp->getExprLoc());
+        } else if (Category == TypeCategory::Pointer) {
           // This assignment updates a Pointer
           PSet PS = EvalExprForPSet(BinOp->getRHS(), false);
-          SetPSet(*V, PS, BinOp->getExprLoc());
+          SetPSet(V, PS, BinOp->getExprLoc());
         }
         return;
       } else if (BinOp->getLHS()->getType()->isPointerType() &&
                  (BinOp->getOpcode() == BO_AddAssign ||
                   BinOp->getOpcode() == BO_SubAssign)) {
         // Affects pset; forbidden by the bounds profile.
-        if (llvm::Optional<Variable> V = refersTo(BinOp->getLHS())) {
-          SetPSet(*V,
-                  PSet::invalid(InvalidationReason::PointerArithmetic(
-                      BinOp->getExprLoc())),
-                  BinOp->getExprLoc());
-        }
+        Variable V = refersTo(BinOp->getLHS());
+        SetPSet(V,
+                PSet::invalid(
+                    InvalidationReason::PointerArithmetic(BinOp->getExprLoc())),
+                BinOp->getExprLoc());
         // TODO: diagnose even if we have no VarDecl?
       }
       break;
@@ -841,7 +846,8 @@ class PSetsBuilder {
       }
       break;
     }
-    case Expr::CallExprClass: {
+    case Expr::CallExprClass:
+    case Expr::CXXMemberCallExprClass: {
       if (EvalCallExpr(cast<CallExpr>(E)))
         return;
       break;
@@ -853,65 +859,199 @@ class PSetsBuilder {
       EvalStmt(SubStmt);
   }
 
+  struct CallArguments {
+    std::vector<const Expr *> Oin_strong;
+    std::vector<const Expr *> Oin_weak;
+    std::vector<const Expr *> Oin;
+    std::vector<const Expr *> Pin;
+    // The pointee is the output
+    std::vector<const Expr *> Pout;
+  };
+
+  void PushCallArguments(const Expr *Arg, QualType ParamQType,
+                         CallArguments &Args) {
+    // TODO implement gsl::lifetime annotations
+    // TODO implement aggregates
+    const Type *ParamType = ParamQType->getUnqualifiedDesugaredType();
+
+    if (auto *R = dyn_cast<ReferenceType>(ParamType)) {
+      if (classifyTypeCategory(R->getPointeeType()) == TypeCategory::Owner) {
+        if (isa<RValueReferenceType>(R)) {
+          Args.Oin_strong.push_back(Arg);
+        } else if (ParamQType.isConstQualified()) {
+          Args.Oin_weak.push_back(Arg);
+        } else {
+          Args.Oin.push_back(Arg);
+        }
+      } else {
+        // Type Category is Pointer due to raw references.
+        Args.Pin.push_back(Arg);
+      }
+
+    } else if (classifyTypeCategory(ParamQType) == TypeCategory::Pointer) {
+      Args.Pin.push_back(Arg);
+    }
+
+    // A “function output” means a return value or a parameter passed by raw
+    // pointer to non-const (and is not considered to include the top-level raw
+    // pointer, because the output is the pointee).
+    if (ParamQType->isPointerType()) {
+      auto Pointee = ParamType->getPointeeType();
+      if (!Pointee.isConstQualified() &&
+          classifyTypeCategory(Pointee) == TypeCategory::Pointer)
+        Args.Pout.push_back(Arg);
+    }
+  }
+
+  struct CallTypes {
+    const FunctionProtoType *FTy = nullptr;
+    const CXXRecordDecl *ClassDecl = nullptr;
+  };
+
+  CallTypes GetCallTypes(const Expr *CalleeE) {
+    CallTypes CT;
+
+    if (CalleeE->hasPlaceholderType(BuiltinType::BoundMember)) {
+      CalleeE = CalleeE->IgnoreParenImpCasts();
+      if (const auto *BinOp = dyn_cast<BinaryOperator>(CalleeE)) {
+        auto MemberPtr =
+            BinOp->getRHS()->getType()->castAs<MemberPointerType>();
+        CT.FTy = dyn_cast<FunctionProtoType>(
+            MemberPtr->getPointeeType().IgnoreParens().getTypePtr());
+        CT.ClassDecl = MemberPtr->getClass()->getAsCXXRecordDecl();
+        assert(CT.FTy);
+        assert(CT.ClassDecl);
+        return CT;
+      }
+
+      if (const auto *ME = dyn_cast<MemberExpr>(CalleeE)) {
+        CT.FTy = dyn_cast<FunctionProtoType>(ME->getMemberDecl()->getType());
+        auto ClassType = ME->getBase()->getType();
+        if (ClassType->isPointerType())
+          ClassType = ClassType->getPointeeType();
+        CT.ClassDecl = ClassType->getAsCXXRecordDecl();
+        assert(CT.FTy);
+        assert(CT.ClassDecl);
+        return CT;
+      }
+
+      CalleeE->dump();
+      llvm_unreachable("not a binOp after boundMember");
+    }
+
+    auto *P = dyn_cast<PointerType>(
+        CalleeE->getType()->getUnqualifiedDesugaredType());
+    assert(P);
+    CT.FTy = dyn_cast<FunctionProtoType>(
+        P->getPointeeType()->getUnqualifiedDesugaredType());
+
+    assert(CT.FTy);
+    return CT;
+  }
+
+  /// Get recursively all references non-Pointers in this pset and the psets
+  /// of all references Pointers.
+  std::set<Variable> GetNonPointersRecursive(const PSet &PS) {
+    std::set<Variable> NonPointers;
+    for (auto &KV : PS.vars()) {
+      auto &Var = KV.first;
+      if (Var.isCategoryPointer()) {
+        auto S = GetNonPointersRecursive(GetPSet(Var));
+        NonPointers.insert(S.begin(), S.end());
+      } else
+        NonPointers.insert(Var);
+    }
+    return NonPointers;
+  }
+
   /// Evaluates the CallExpr for effects on psets.
   /// When a non-const pointer to pointer or reference to pointer is passed
   /// into a function, it's pointee's are invalidated.
   /// Returns true if CallExpr was handled.
   bool EvalCallExpr(const CallExpr *CallE) {
+    llvm::errs() << "EvalCallExpr\n";
+    CallE->dump();
     EvalExpr(CallE->getCallee());
 
-    auto *P = dyn_cast<PointerType>(
-        CallE->getCallee()->getType()->getUnqualifiedDesugaredType());
-    assert(P);
-    auto *F = dyn_cast<FunctionProtoType>(
-        P->getPointeeType()->getUnqualifiedDesugaredType());
-    // F->dump();
-    assert(F);
+    auto *CalleeE = CallE->getCallee();
+    CallTypes CT = GetCallTypes(CalleeE);
+    CallArguments Args;
     for (unsigned i = 0; i < CallE->getNumArgs(); ++i) {
       const Expr *Arg = CallE->getArg(i);
       QualType ParamQType =
-          F->isVariadic() ? Arg->getType() : F->getParamType(i);
-      const Type *ParamType = ParamQType->getUnqualifiedDesugaredType();
+          CT.FTy->isVariadic() ? Arg->getType() : CT.FTy->getParamType(i);
 
-      // TODO implement strong owner rvalue magnets
-      // TODO implement gsl::lifetime annotations
-      // TODO implement aggregates
-
-      if (auto *R = dyn_cast<ReferenceType>(ParamType)) {
-        if (classifyTypeCategory(R->getPointeeType()) == TypeCategory::Owner) {
-          if (isa<RValueReferenceType>(R)) {
-            // parameter is in Oin_strong
-          } else if (ParamQType.isConstQualified()) {
-            // parameter is in Oin_weak
-          } else {
-            // parameter is in Oin
-          }
-        } else {
-          // parameter is in Pin
-        }
-
-      } else if (classifyTypeCategory(ParamQType) == TypeCategory::Pointer) {
-        // parameter is in Pin
-      }
-
-      auto Pointee = ParamType->getPointeeType();
-      if (!Pointee.isNull()) {
-        if (!Pointee.isConstQualified() &&
-            classifyTypeCategory(Pointee) == TypeCategory::Pointer) {
-          // Pout
-        }
-      }
-
-      // Enforce that psets of all arguments in Oin and Pin do not alias
-      // Enforce that pset() of each argument does not refer to a non-const
-      // global Owner Enforce that pset() of each argument does not refer to a
-      // local Owner in Oin
-
-      PSet PS = EvalExprForPSet(Arg, !ParamType->isPointerType());
-      CheckPSetValidity(PS, Arg->getLocStart(), /*flagNull=*/false);
+      PushCallArguments(Arg, ParamQType, Args); // appends into Args
     }
+
+    if (CT.ClassDecl) {
+      // A this pointer parameter is treated as if it were declared as a
+      // reference to the current object
+      auto *MemberCall = dyn_cast<CXXMemberCallExpr>(CallE);
+      assert(MemberCall);
+      auto *Object = MemberCall->getImplicitObjectArgument();
+
+      // TODO: *this is gsl::non_null annotated
+      auto LValRefToObject = ASTCtxt.getLValueReferenceType(
+          Object->getType(), /*SpelledAsLValue=*/true);
+      if (CT.FTy->isConst())
+        LValRefToObject.addConst();
+
+      PushCallArguments(Object, LValRefToObject, Args); // appends into Args
+    }
+
+    // TODO If p is annotated [[gsl::lifetime(x)]], then ensure that pset(p) ==
+    // pset(x)
+
+    struct PinInfo {
+      SourceLocation Loc;
+      PSet PS;
+    };
+    std::vector<PinInfo> Pin;
+    llvm::errs() << "Start Pin: ";
+    for (auto &ArgExpr : Args.Pin) {
+      ArgExpr->dump();
+      PSet PS = EvalExprForPSet(ArgExpr, !ArgExpr->getType()->isPointerType());
+      Pin.push_back(PinInfo{ArgExpr->getExprLoc(), PS});
+    }
+
+    // Enforce that psets of all arguments in Oin and Pin do not alias
+    std::map<Variable, SourceLocation> AllVars;
+    // TODO add Oin to set for checking disjointness
+    // for(auto &ArgExpr : Args.Oin) {
+    //  AllVars.emplace(get)
+    //}
+    for (auto &PinI : Pin) {
+      // TODO check null/non-null annotation
+      // TODO: emit warn_parameter_dangling instead of warn_deref_dangling
+      CheckPSetValidityRecursive(PinI.PS, PinI.Loc);
+
+      for (auto &Var : GetNonPointersRecursive(PinI.PS)) {
+        // pset(argument(p)) and pset(argument(x)) must be disjoint (as long as
+        // not annotated)
+        auto i = AllVars.emplace(Var, PinI.Loc);
+        if (!i.second) {
+          if (Reporter)
+            Reporter->warnParametersAlias(PinI.Loc, i.first->second,
+                                          Var.getName());
+        }
+      }
+    }
+
+    // If p is explicitly lifetime-annotated with x, then each call site
+    // enforces the precondition that argument(p) is a valid Pointer and
+    // pset(argument(p)) == pset(argument(x)), and in the callee on function
+    // entry set pset(p) = pset(x).
+
+    // Enforce that pset() of each argument does not refer to a non-const
+    // global Owner
+
+    // Enforce that pset() of each argument does not refer to a
+    // local Owner in Oin
+
     return true;
   }
+
   /// Evaluates E for effects that change psets.
   /// 1) if referenceCtx is true, returns the pset of 'p' in 'auto &p =
   /// E';
@@ -1092,6 +1232,8 @@ class PSetsBuilder {
   void CheckPSetValidity(const PSet &PS, SourceLocation Loc,
                          bool flagNull = true);
 
+  void CheckPSetValidityRecursive(const PSet &PS, SourceLocation Loc);
+
   // Traverse S in depth-first post-order and evaluate all effects on psets
   void EvalStmt(const Stmt *S) {
     if (const auto *DS = dyn_cast<DeclStmt>(S)) {
@@ -1238,6 +1380,24 @@ void PSetsBuilder::SetPSet(Variable P, PSet PS, SourceLocation Loc) {
     i->second = std::move(PS);
   else
     PSets.emplace(P, PS);
+}
+
+/// Diagnoses unknown or invalid PSets for the given PSet and
+/// recursively for every Pointer therein.
+void PSetsBuilder::CheckPSetValidityRecursive(const PSet &PS,
+                                              SourceLocation Loc) {
+  // TODO diagnostics will say that Pointer is invalid, even though it might
+  // only point to a Pointer that is invalid. Improve diagnostics.
+  CheckPSetValidity(PS, Loc, /*flagNull=*/false);
+
+  for (auto &KV : PS.vars()) {
+    auto &Var = KV.first;
+    // TODO: a moved-from Owner can also be invalid
+    if (!Var.isCategoryPointer())
+      continue;
+
+    CheckPSetValidityRecursive(GetPSet(Var), Loc);
+  }
 }
 
 void PSetsBuilder::CheckPSetValidity(const PSet &PS, SourceLocation Loc,

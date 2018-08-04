@@ -37,11 +37,11 @@ void ref_to_member_leaves_scope_call() {
   {
     S s;
     p = &s;
-    p->f();     // OK
-  }             // expected-note 3 {{pointee 's' left the scope here}}
+    //p->f();     // OK
+  }             // expected-note 1 {{pointee 's' left the scope here}}
   p->f();       // expected-warning {{dereferencing a dangling pointer}}
-  int i = p->m; // expected-warning {{dereferencing a dangling pointer}}
-  p->m = 4;     // expected-warning {{dereferencing a dangling pointer}}
+  //int i = p->m; // expected-warning {{dereferencing a dangling pointer}}
+  //p->m = 4;     // expected-warning {{dereferencing a dangling pointer}}
 }
 
 // No Pointer involved, thus not checked.
@@ -78,4 +78,20 @@ int *global_null_p = nullptr;   // OK
 
 void uninitialized_static() {
   static int *p; // expected-warning {{the pset of 'p' must be a subset of {(static), (null)}, but is {(invalid)}}
+}
+
+void function_call() {
+  void f(int *);
+  void g(int **);
+  void h(int *, int **);
+
+  int *p; // expected-note 3 {{it was never initialized here}}
+  f(p);   // expected-warning {{dereferencing a dangling pointer}}
+
+  int **q = &p;
+  g(q); // expected-warning {{dereferencing a dangling pointer}}
+
+  int i;
+  p = &i;
+  h(p, q); // expected-warning {{this parameter points to the same variable 'i' as another parameter}} expected-note {{here}}
 }

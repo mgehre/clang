@@ -493,6 +493,7 @@ private:
 
 // TODO optimize (sorted vector?)
 using PSetsMap = std::map<Variable, PSet>;
+using ExprPSets = std::map<const Expr *, PSet>;
 
 } // namespace lifetime
 } // namespace clang

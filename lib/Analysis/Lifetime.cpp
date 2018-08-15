@@ -39,6 +39,8 @@ class LifetimeContext {
     /// For blocks representing a branch, we have different psets for
     /// the true and the false branch.
     llvm::Optional<PSetsMap> FalseBranchExitPMap;
+    /// PSets for active expressions (that are being evaluated).
+    ExprPSets SubExprPSets;
   };
 
   ASTContext &ASTCtxt;
@@ -50,10 +52,8 @@ class LifetimeContext {
   AnalysisDeclContext AC;
   LifetimeReporterBase &Reporter;
 
-  std::map<const Expr *, PSet> PSetsOfExpr;
-  std::map<const Expr *, PSet> RefersTo;
-
-  bool computeEntryPSets(const CFGBlock &B, PSetsMap &EntryPMap);
+  bool computeEntryPSets(const CFGBlock &B, PSetsMap &EntryPMap,
+    ExprPSets &ActiveSubExprs);
 
   BlockContext &getBlockContext(const CFGBlock *B) {
     return BlockContexts[B->getBlockID()];
@@ -104,6 +104,7 @@ public:
     AC.getCFGBuildOptions().AddLifetime = true;
     AC.getCFGBuildOptions().AddStaticInitBranches = true;
     AC.getCFGBuildOptions().AddCXXNewAllocator = true;
+    AC.getCFGBuildOptions().setAllAlwaysAdd();
     // TODO AddTemporaryDtors
     // TODO AddEHEdges
     ControlFlowGraph = AC.getCFG();
@@ -119,7 +120,8 @@ public:
 /// Returns true if this block is reachable, i.e. one of it predecessors has
 /// been visited.
 bool LifetimeContext::computeEntryPSets(const CFGBlock &B,
-                                        PSetsMap &EntryPMap) {
+                                        PSetsMap &EntryPMap,
+                                        ExprPSets &ActiveSubExprs) {
   // If no predecessors have been visited by now, this block is not
   // reachable
   bool IsReachable = false;
@@ -164,6 +166,10 @@ bool LifetimeContext::computeEntryPSets(const CFGBlock &B,
         PS.merge(J->second);
       }
     }
+    // Expressions might be active across basic blocks.
+    for (const auto &ExprAndPSet : PredBC.SubExprPSets) {
+      ActiveSubExprs.insert(ExprAndPSet);
+    }
   }
   return IsReachable;
 }
@@ -198,7 +204,7 @@ void LifetimeContext::TraverseBlocks() {
       // Compute entry psets of this block by merging exit psets of all
       // reachable predecessors.
       PSetsMap EntryPMap;
-      bool isReachable = computeEntryPSets(*B, EntryPMap);
+      bool isReachable = computeEntryPSets(*B, EntryPMap, BC.SubExprPSets);
       if (!isReachable)
         continue;
 
@@ -210,7 +216,7 @@ void LifetimeContext::TraverseBlocks() {
 
       BC.EntryPMap = EntryPMap;
       BC.ExitPMap = BC.EntryPMap;
-      VisitBlock(BC.ExitPMap, BC.FalseBranchExitPMap, PSetsOfExpr, RefersTo,
+      VisitBlock(BC.ExitPMap, BC.FalseBranchExitPMap, BC.SubExprPSets,
                  *B, Reporter, ASTCtxt);
       BC.visited = true;
       Updated = true;

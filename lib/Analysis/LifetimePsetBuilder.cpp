@@ -10,7 +10,7 @@
 #include "clang/Analysis/Analyses/LifetimePsetBuilder.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/ExprCXX.h"
-#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
 #include "clang/Analysis/Analyses/Lifetime.h"
 #include "clang/Analysis/CFG.h"
 
@@ -49,7 +49,7 @@ static bool isPointer(const Expr *E) {
 // Diagnose: static_cast to lvalue ref
 // TODO: handle
 // - CXXDefaultArgExpr
-class PSetsBuilder : public RecursiveASTVisitor<PSetsBuilder> {
+class PSetsBuilder : public ConstStmtVisitor<PSetsBuilder, bool> {
 
   LifetimeReporterBase &Reporter;
   ASTContext &ASTCtxt;
@@ -57,8 +57,7 @@ class PSetsBuilder : public RecursiveASTVisitor<PSetsBuilder> {
   /// by their non-reference variable declaration or
   /// MaterializedTemporaryExpr plus (optional) FieldDecls.
   PSetsMap &PMap;
-  std::map<const Expr *, PSet> &PSetsOfExpr;
-  std::map<const Expr *, PSet> &RefersTo;
+  ExprPSets &SubExprPSets;
 
 public:
   bool shouldTraversePostOrder() const { return true; }
@@ -88,12 +87,20 @@ public:
 
   bool VisitImplicitCastExpr(const ImplicitCastExpr *E) {
     if (E->getCastKind() == CK_NullToPointer)
-      setPSet(E, PSet::null(E->getExprLoc()));
+      setResultPSet(E, PSet::null(E->getExprLoc()));
 
     return true;
   }
 
-  bool VisitDeclRefExpr(DeclRefExpr *DeclRef) {
+  bool VisitDeclStmt(const DeclStmt* DS) {
+    for (const auto *DeclIt : DS->decls()) {
+      if (const auto *VD = dyn_cast<VarDecl>(DeclIt))
+        return VisitVarDecl(VD);
+    }
+    return true;
+  }
+
+  bool VisitDeclRefExpr(const DeclRefExpr *DeclRef) {
     auto varRefersTo = [this](QualType QT, Variable V) {
       if (QT->isLValueReferenceType())
         return getPSet(V);
@@ -101,82 +108,86 @@ public:
         return PSet::singleton(V, false);
     };
 
+    PSet Result;
     if (auto *VD = dyn_cast<VarDecl>(DeclRef->getDecl())) {
-      RefersTo[DeclRef] = varRefersTo(VD->getType(), VD);
+      Result = varRefersTo(VD->getType(), VD);
     } else if (auto *FD = dyn_cast<FieldDecl>(DeclRef->getDecl())) {
       Variable V = Variable::thisPointer();
       V.addFieldRef(FD);
-      RefersTo[DeclRef] = varRefersTo(FD->getType(), V);
+      Result = varRefersTo(FD->getType(), V);
     }
 
+    setResultPSet(DeclRef, Result);
     return true;
   }
 
   bool VisitMemberExpr(const MemberExpr *ME) {
-    PSet BaseRefersTo;
+    PSet Result = consumeSubExpr(ME->getBase());
     if (ME->getBase()->getType()->isPointerType()) {
       // This is like a deref plus member expr.
-      BaseRefersTo = getPSet(ME->getBase());
-      CheckPSetValidity(BaseRefersTo, ME->getExprLoc());
-    } else {
-      BaseRefersTo = RefersTo[ME->getBase()];
+      checkPSetValidity(Result, ME->getExprLoc());
     }
 
     if (auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {
-      PSet Ret = BaseRefersTo;
-      Ret.addFieldRef(FD);
-      RefersTo[ME] = Ret;
+      Result.addFieldRef(FD);
     } else if (isa<VarDecl>(ME->getMemberDecl())) {
       // A static data member of this class
-      RefersTo[ME] = PSet::staticVar(false);
+      Result = PSet::staticVar(false);
+    } else {
+      // Method call.
     }
 
+    setResultPSet(ME, Result);
     return true;
   }
 
   bool VisitArraySubscriptExpr(const ArraySubscriptExpr *E) {
+    // Do not use the PSet of SubExpr.
+    consumeSubExpr(E->getBase());
+
     // By the bounds profile, ArraySubscriptExpr is only allowed on arrays
     // (not on pointers), thus the base needs to be a DeclRefExpr.
     const auto *DeclRef =
         dyn_cast<DeclRefExpr>(E->getBase()->IgnoreParenImpCasts());
 
     // Unless we see the actual array, we assume it is pointer arithmetic.
-    auto &Ref = RefersTo[E];
-    Ref = PSet::invalid(InvalidationReason::PointerArithmetic(E->getExprLoc()));
-    if (!DeclRef)
+    PSet Result = PSet::invalid(InvalidationReason::PointerArithmetic(E->getExprLoc()));
+    if (!DeclRef) {
+      setResultPSet(E, Result);
       return true;
+    }
 
     const VarDecl *VD = dyn_cast<VarDecl>(DeclRef->getDecl());
     assert(VD);
     if (VD->getType().getCanonicalType()->isArrayType())
-      Ref = PSet::singleton(VD, false);
+      Result = PSet::singleton(VD, false);
 
+    setResultPSet(E, Result);
     return true;
   }
 
   bool VisitCXXThisExpr(const CXXThisExpr *E) {
-    setPSet(E, PSet::singleton(Variable::thisPointer(), false));
+    setResultPSet(E, PSet::singleton(Variable::thisPointer(), false));
     return true;
   }
 
   bool VisitConditionalOperator(const ConditionalOperator *E) {
-    if (E->isLValue())
-      RefersTo[E] = refersTo(E->getLHS()) + refersTo(E->getRHS());
-
-    if (hasPSet(E))
-      setPSet(E, getPSet(E->getLHS()) + getPSet(E->getRHS()));
-
+    PSet Result = consumeSubExpr(E->getLHS()) + consumeSubExpr(E->getRHS());
+    setResultPSet(E, Result);
     return true;
   }
 
   bool VisitMaterializeTemporaryExpr(const MaterializeTemporaryExpr *E) {
+    PSet Result;
     if (E->getExtendingDecl()) {
       PSet Singleton = PSet::singleton(E, false, 0);
-      RefersTo[E] = Singleton;
+      PSet SubExpr = consumeSubExpr(E->GetTemporaryExpr());
+      Result = Singleton;
       if (hasPSet(E->GetTemporaryExpr()))
-        setPSet(Singleton, getPSet(E->GetTemporaryExpr()), E->getLocStart());
+        updatePMap(Singleton, SubExpr, E->getLocStart());
     } else
-      RefersTo[E] = PSet::singleton(Variable::temporary(), false, 0);
+      Result = PSet::singleton(Variable::temporary(), false, 0);
+    setResultPSet(E, Result);
     return true;
   }
 
@@ -186,118 +197,89 @@ public:
 
     if (I->getType()->isPointerType()) {
       if (I->getNumInits() == 0)
-        setPSet(I, PSet::null(I->getLocStart()));
+        setResultPSet(I, PSet::null(I->getLocStart()));
       else if (I->getNumInits() == 1)
-        setPSet(I, getPSet(I->getInit(0)));
+        setResultPSet(I, getPSet(consumeSubExpr(I->getInit(0))));
     }
     return true;
   }
 
   bool VisitCXXReinterpretCastExpr(const CXXReinterpretCastExpr *E) {
     // Not allowed by bounds profile
-    setPSet(E,
+    setResultPSet(E,
             PSet::invalid(InvalidationReason::ForbiddenCast(E->getExprLoc())));
     return true;
   }
 
   bool VisitCStyleCastExpr(const CStyleCastExpr *E) {
+    PSet SubExpr = consumeSubExpr(E->getSubExpr());
     switch (E->getCastKind()) {
     case CK_BitCast:
     case CK_LValueBitCast:
     case CK_IntegralToPointer:
-      assert(!E->isLValue());
       // Those casts are forbidden by the type profile
-      setPSet(
+      setResultPSet(
           E, PSet::invalid(InvalidationReason::ForbiddenCast(E->getExprLoc())));
       return true;
-    default: {
-      if (E->isLValue())
-        RefersTo[E] = refersTo(E->getSubExpr());
-
-      if (hasPSet(E))
-        setPSet(E, getPSet(E->getSubExpr()));
+    default:
+      setResultPSet(E, SubExpr);
       return true;
     }
-    }
-  }
-
-  bool VisitBinAssign(const BinaryOperator *BO) {
-    auto TC = classifyTypeCategory(BO->getType());
-
-    if (TC == TypeCategory::Owner) {
-      // When an Owner x is copied to or moved to, set pset(x) = {x'}
-      // setPSet(refersTo(BO->getLHS()), PSet::singleton(V, false, 1),
-      // BinOp->getExprLoc());
-      // TODO
-    } else if (TC == TypeCategory::Pointer) {
-      // This assignment updates a Pointer
-      setPSet(refersTo(BO->getLHS()), getPSet(BO->getRHS()), BO->getExprLoc());
-    }
-
-    RefersTo[BO] = refersTo(BO->getLHS());
-    return true;
-  }
-
-  bool TraverseBinaryOperator(BinaryOperator *BO) {
-    // Logical and, or have short circuit which is represented in the CFG.
-    // We do not need to traverse the AST further.
-    auto OpCode = BO->getOpcode();
-    if (OpCode == BO_LAnd || OpCode == BO_LOr)
-      return true;
-    return RecursiveASTVisitor<PSetsBuilder>::TraverseBinaryOperator(BO);
-  }
-
-  bool TraverseConditionalOperator(const ConditionalOperator *) {
-    // This is already split into parts in the CFG, no need to traverse again
-    // here.
-    return true;
   }
 
   bool VisitBinaryOperator(const BinaryOperator *BO) {
+    PSet LhsPSet = consumeSubExpr(BO->getLHS());
+    PSet RhsPSet = consumeSubExpr(BO->getRHS());
     if (BO->getOpcode() == BO_Assign) {
-      VisitBinAssign(BO);
+      auto TC = classifyTypeCategory(BO->getType());
+
+      if (TC == TypeCategory::Owner) {
+        // When an Owner x is copied to or moved to, set pset(x) = {x'}
+        // setPSet(refersTo(BO->getLHS()), PSet::singleton(V, false, 1),
+        // BinOp->getExprLoc());
+        // TODO
+      } else if (TC == TypeCategory::Pointer) {
+        // This assignment updates a Pointer
+        llvm::errs() << "Update PMap: " << LhsPSet.str() << " "  << RhsPSet.str() << "\n";
+        updatePMap(LhsPSet, RhsPSet, BO->getExprLoc());
+      }
+
+      setResultPSet(BO, LhsPSet);
     } else if (hasPSet(BO)) {
-      setPSet(BO, PSet::invalid(
-                      InvalidationReason::PointerArithmetic(BO->getExprLoc())));
+      setResultPSet(BO, PSet::invalid(
+        InvalidationReason::PointerArithmetic(BO->getExprLoc())));
     }
     return true;
   }
 
   bool VisitUnaryOperator(const UnaryOperator *UO) {
+    PSet SubPSet = consumeSubExpr(UO->getSubExpr());
     switch (UO->getOpcode()) {
     case UO_AddrOf:
-      return VisitUnaryAddrOf(UO);
-    case UO_Deref:
-      return VisitUnaryDeref(UO);
+      if (hasPSet(UO))
+        setResultPSet(UO, SubPSet);
+      return true;
+    case UO_Deref: {
+      PSet PointsTo = getPSet(SubPSet);
+      checkPSetValidity(PointsTo, UO->getExprLoc());
+      setResultPSet(UO, PointsTo);
+      return true;
+    }
     default:
       if (UO->getType()->isPointerType())
-        setPSet(refersTo(UO->getSubExpr()),
-                PSet::invalid(
-                    InvalidationReason::PointerArithmetic(UO->getExprLoc())),
-                UO->getExprLoc());
+        setResultPSet(UO,
+                   PSet::invalid(
+                     InvalidationReason::PointerArithmetic(UO->getExprLoc())));
       return true;
     }
   }
 
-  bool VisitUnaryAddrOf(const UnaryOperator *UO) {
-    if (hasPSet(UO))
-      setPSet(UO, refersTo(UO->getSubExpr()));
-    return true;
-  }
-
-  bool VisitUnaryDeref(const UnaryOperator *UO) {
-    auto PS = getPSet(UO->getSubExpr());
-    CheckPSetValidity(PS, UO->getExprLoc());
-
-    RefersTo[UO] = PS;
-    return true;
-  }
 
   bool VisitLambdaExpr(const LambdaExpr *E) {
     // TODO: if this is a Pointer (because it captures by reference, fill the
     // pset to what it had captured)
     if (hasPSet(E))
-      setPSet(E, PSet{});
+      setResultPSet(E, PSet{});
     return true;
   }
 
@@ -307,21 +289,8 @@ public:
     // should we assume that the pointer points into that owner
     // i.e. pset(p) = {o'}?
     if (isPointer(E))
-      setPSet(E, PSet::null(E->getExprLoc()));
+      setResultPSet(E, PSet::null(E->getExprLoc()));
     return true;
-  }
-
-  // Returns the storage to which the expression refers to.
-  PSet refersTo(const Expr *E) {
-    assert(E->isLValue());
-    auto i = RefersTo.find(IgnoreParenImpCasts(E));
-    /*if (i == RefersTo.end())
-      return {};*/
-    if (i == RefersTo.end()) {
-      E->dump();
-      assert(i != RefersTo.end());
-    }
-    return i->second;
   }
 
   struct CallArgument {
@@ -346,25 +315,26 @@ public:
     // TODO implement gsl::lifetime annotations
     // TODO implement aggregates
     const Type *ParamType = ParamQType->getUnqualifiedDesugaredType();
+    PSet ArgPSet = consumeSubExpr(Arg);
 
     if (auto *R = dyn_cast<ReferenceType>(ParamType)) {
       if (classifyTypeCategory(R->getPointeeType()) == TypeCategory::Owner) {
         if (isa<RValueReferenceType>(R)) {
-          Args.Oin_strong.emplace_back(Arg->getExprLoc(), getPSet(Arg),
+          Args.Oin_strong.emplace_back(Arg->getExprLoc(), ArgPSet,
                                        ParamQType);
         } else if (ParamQType.isConstQualified()) {
-          Args.Oin_weak.emplace_back(Arg->getExprLoc(), getPSet(Arg),
+          Args.Oin_weak.emplace_back(Arg->getExprLoc(), ArgPSet,
                                      ParamQType);
         } else {
-          Args.Oin.emplace_back(Arg->getExprLoc(), getPSet(Arg), ParamQType);
+          Args.Oin.emplace_back(Arg->getExprLoc(), ArgPSet, ParamQType);
         }
       } else {
         // Type Category is Pointer due to raw references.
-        Args.Pin.emplace_back(Arg->getExprLoc(), refersTo(Arg), ParamQType);
+        Args.Pin.emplace_back(Arg->getExprLoc(), ArgPSet, ParamQType);
       }
 
     } else if (classifyTypeCategory(ParamQType) == TypeCategory::Pointer) {
-      Args.Pin.emplace_back(Arg->getExprLoc(), getPSet(Arg), ParamQType);
+      Args.Pin.emplace_back(Arg->getExprLoc(), ArgPSet, ParamQType);
     }
 
     // A “function output” means a return value or a parameter passed by raw
@@ -515,7 +485,7 @@ public:
   bool VisitCallExpr(const CallExpr *CallE) {
     // Handle call to clang_analyzer_pset, which will print the pset of its
     // argument
-    if (HandleClangAnalyzerPset(CallE))
+    if (handleClangAnalyzerPset(CallE))
       return true;
 
     auto *CalleeE = CallE->getCallee();
@@ -543,8 +513,7 @@ public:
           return CT.FTy->getParamType(i);
       }();
 
-      PushCallArguments(Arg, ParamQType,
-                        Args); // appends into Args
+      PushCallArguments(Arg, ParamQType, Args); // appends into Args
     }
 
     if (CT.ClassDecl) {
@@ -553,8 +522,9 @@ public:
       if (const auto *MemberCall = dyn_cast<CXXMemberCallExpr>(CallE)) {
         auto *Object = MemberCall->getImplicitObjectArgument();
         assert(Object);
-
         QualType ObjectType = Object->getType();
+        PSet ObjectPSet = consumeSubExpr(MemberCall->getCallee());
+
         if (ObjectType->isPointerType())
           ObjectType = ObjectType->getPointeeType();
 
@@ -562,8 +532,8 @@ public:
         if (TC == TypeCategory::Pointer || TC == TypeCategory::Owner) {
           PSet PS = [&] {
             if (Object->getType()->isPointerType())
-              return derefPSet(getPSet(Object), CallE->getExprLoc());
-            return getPSet(Object);
+              return derefPSet(ObjectPSet, CallE->getExprLoc());
+            return ObjectPSet;
           }();
           if (TC == TypeCategory::Pointer)
             Args.Pin.emplace_back(CallE->getExprLoc(), PS, ObjectType);
@@ -598,14 +568,11 @@ public:
       }
       return Ret;
     };
-    if (CallE->isLValue())
-      RefersTo[CallE] = computeRetPset();
-    else if (hasPSet(CallE))
-      setPSet(CallE, computeRetPset());
+    setResultPSet(CallE, computeRetPset());
     return true;
   }
 
-  void CheckPSetValidity(const PSet &PS, SourceLocation Loc);
+  void checkPSetValidity(const PSet &PS, SourceLocation Loc);
 
   /// Invalidates all psets that point to V or something owned by V
   void invalidateOwner(Variable O, unsigned order, InvalidationReason Reason) {
@@ -616,8 +583,8 @@ public:
         continue; // Nothing to invalidate
 
       if (PS.containsBase(O, order))
-        setPSet(PSet::singleton(Pointer), PSet::invalid(Reason),
-                Reason.getLoc());
+        updatePMap(PSet::singleton(Pointer), PSet::invalid(Reason),
+                   Reason.getLoc());
     }
   }
 
@@ -625,18 +592,19 @@ public:
 
   PSet getPSet(Variable P);
 
-  PSet getPSet(const Expr *E) {
+  PSet consumeSubExpr(const Expr *E) {
+    if (!E->isLValue() && !hasPSet(E))
+      return PSet::singleton(Variable::temporary(), false);
     E = IgnoreParenImpCasts(E);
-    assert(hasPSet(E));
-
-    auto i = PSetsOfExpr.find(E);
-    if (i != PSetsOfExpr.end())
-      return i->second;
-
-    // If we have no pset, we might still have a refersTo set for this
-    // expression. Then the pset of this expressions is the merged pset of
-    // everything that it refers to.
-    return getPSet(refersTo(E));
+    auto I = SubExprPSets.find(E);
+    if (I == SubExprPSets.end())
+      E->dump();
+    assert (I != SubExprPSets.end());
+    PSet Ret = I->second;
+    //SubExprPSets.erase(I);
+    llvm::errs() << "Consumed:\n";
+    E->dump();
+    return Ret;
   }
 
   PSet getPSet(const PSet &P) {
@@ -652,15 +620,20 @@ public:
     return Ret;
   }
 
-  void setPSet(const Expr *E, PSet PS) {
-    assert(hasPSet(E));
-    auto I = PSetsOfExpr.find(E);
-    if (I != PSetsOfExpr.end())
-      I->second = std::move(PS);
-    else
-      PSetsOfExpr.emplace(E, PS);
+  void setResultPSet(const Expr *E, PSet PS) {
+    llvm::errs() << "Setting PSET: " << PS.str() << " for: \n";
+    E->dump();
+    // We should not set the result PSet for skipped AST nodes.
+    assert(IgnoreParenImpCasts(E) == E);
+    auto I = SubExprPSets.find(E);
+    if (I != SubExprPSets.end()) {
+      llvm::errs() << "Redundant set:" << I->second.str() << "\n";
+    }
+    //assert (I == SubExprPSets.end());
+    SubExprPSets.emplace(E, PS);
   }
-  void setPSet(PSet LHS, PSet RHS, SourceLocation Loc);
+
+  void updatePMap(PSet LHS, PSet RHS, SourceLocation Loc);
   PSet derefPSet(PSet P, SourceLocation Loc);
 
   void diagPSet(Variable V, SourceLocation Loc) {
@@ -668,14 +641,13 @@ public:
     Reporter.debugPset(Loc, V.getName(), set.str());
   }
 
-  bool HandleClangAnalyzerPset(const CallExpr *CallE);
+  bool handleClangAnalyzerPset(const CallExpr *CallE);
 
 public:
   PSetsBuilder(LifetimeReporterBase &Reporter, ASTContext &ASTCtxt,
-               PSetsMap &PMap, std::map<const Expr *, PSet> &PSetsOfExpr,
-               std::map<const Expr *, PSet> &RefersTo)
+               PSetsMap &PMap, ExprPSets &SubExprPSets)
       : Reporter(Reporter), ASTCtxt(ASTCtxt), PMap(PMap),
-        PSetsOfExpr(PSetsOfExpr), RefersTo(RefersTo) {}
+        SubExprPSets(SubExprPSets) {}
 
   bool VisitVarDecl(const VarDecl *VD) {
     const Expr *Initializer = VD->getInit();
@@ -690,10 +662,7 @@ public:
         // TODO: Better diagnostic that explains the array to pointer decay
         PS = PSet::invalid(InvalidationReason::PointerArithmetic(Loc));
       } else if (Initializer) {
-        if (VD->getType()->isReferenceType())
-          PS = refersTo(Initializer);
-        else
-          PS = getPSet(Initializer);
+        PS = consumeSubExpr(Initializer);
       } else {
         // Never treat local statics as uninitialized.
         if (VD->hasGlobalStorage())
@@ -701,11 +670,12 @@ public:
         else
           PS = PSet::invalid(InvalidationReason::NotInitialized(Loc));
       }
-      setPSet(PSet::singleton(VD), PS, Loc);
+      llvm::errs() << "Update PMap: " << PSet::singleton(VD).str() << " "  << PS.str() << "\n";
+      updatePMap(PSet::singleton(VD), PS, Loc);
       break;
     }
     case TypeCategory::Owner: {
-      setPSet(PSet::singleton(VD), PSet::singleton(VD, false, 1), Loc);
+      updatePMap(PSet::singleton(VD), PSet::singleton(VD, false, 1), Loc);
     }
     default:;
     }
@@ -715,7 +685,7 @@ public:
   void VisitBlock(const CFGBlock &B,
                   llvm::Optional<PSetsMap> &FalseBranchExitPMap);
 
-  void UpdatePSetsFromCondition(const Stmt *S, bool Positive,
+  void updatePSetsFromCondition(const Stmt *S, bool Positive,
                                 llvm::Optional<PSetsMap> &FalseBranchExitPMap,
                                 SourceLocation Loc);
 }; // namespace lifetime
@@ -773,7 +743,7 @@ PSet PSetsBuilder::derefPSet(PSet PS, SourceLocation Loc) {
   return RetPS;
 }
 
-void PSetsBuilder::setPSet(PSet LHS, PSet RHS, SourceLocation Loc) {
+void PSetsBuilder::updatePMap(PSet LHS, PSet RHS, SourceLocation Loc) {
   // Assumption: global Pointers have a pset that is a subset of {static,
   // null}
   if (LHS.isStatic() && !RHS.isUnknown() && !RHS.isStatic() && !RHS.isNull())
@@ -797,7 +767,7 @@ void PSetsBuilder::setPSet(PSet LHS, PSet RHS, SourceLocation Loc) {
   }
 }
 
-void PSetsBuilder::CheckPSetValidity(const PSet &PS, SourceLocation Loc) {
+void PSetsBuilder::checkPSetValidity(const PSet &PS, SourceLocation Loc) {
   assert(!PS.isUnknown());
 
   if (PS.containsInvalid()) {
@@ -824,7 +794,7 @@ void PSetsBuilder::CheckPSetValidity(const PSet &PS, SourceLocation Loc) {
 ///  ... // pset of p is 'null'
 /// else
 ///  ... // pset of p does not contain 'null'
-void PSetsBuilder::UpdatePSetsFromCondition(
+void PSetsBuilder::updatePSetsFromCondition(
     const Stmt *S, bool Positive, llvm::Optional<PSetsMap> &FalseBranchExitPMap,
     SourceLocation Loc) {
   const auto *E = dyn_cast_or_null<Expr>(S);
@@ -836,7 +806,7 @@ void PSetsBuilder::UpdatePSetsFromCondition(
     if (const auto *ConvDecl =
             dyn_cast_or_null<CXXConversionDecl>(CE->getDirectCallee())) {
       if (ConvDecl->getConversionType()->isBooleanType())
-        UpdatePSetsFromCondition(CE->getImplicitObjectArgument(), Positive,
+        updatePSetsFromCondition(CE->getImplicitObjectArgument(), Positive,
                                  FalseBranchExitPMap, E->getLocStart());
     }
     return;
@@ -845,7 +815,7 @@ void PSetsBuilder::UpdatePSetsFromCondition(
     if (UO->getOpcode() != UO_LNot)
       return;
     E = UO->getSubExpr();
-    UpdatePSetsFromCondition(E, !Positive, FalseBranchExitPMap,
+    updatePSetsFromCondition(E, !Positive, FalseBranchExitPMap,
                              E->getLocStart());
     return;
   }
@@ -856,22 +826,21 @@ void PSetsBuilder::UpdatePSetsFromCondition(
     // The p == null is the negative case.
     if (OC == BO_EQ)
       Positive = !Positive;
-    const auto *LHS = IgnoreParenImpCasts(BO->getLHS());
-    const auto *RHS = IgnoreParenImpCasts(BO->getRHS());
-    if (!isPointer(LHS) || !isPointer(RHS))
-      return;
+    PSet LHSPSet = consumeSubExpr(BO->getLHS());
+    PSet RHSPSet = consumeSubExpr(BO->getRHS());
 
-    if (LHS->isLValue() && getPSet(RHS).isNull())
-      UpdatePSetsFromCondition(LHS, Positive, FalseBranchExitPMap,
+
+    if (LHSPSet.isNull())
+      updatePSetsFromCondition(BO->getLHS(), Positive, FalseBranchExitPMap,
                                E->getLocStart());
-    else if (RHS->isLValue() && getPSet(LHS).isNull())
-      UpdatePSetsFromCondition(RHS, Positive, FalseBranchExitPMap,
+    else if (RHSPSet.isNull())
+      updatePSetsFromCondition(BO->getRHS(), Positive, FalseBranchExitPMap,
                                E->getLocStart());
     return;
   }
 
-  if (E->isLValue() && hasPSet(E)) {
-    auto Ref = refersTo(E);
+  if (hasPSet(E)) {
+    auto Ref = consumeSubExpr(E);
     // We refer to multiple variables (or none),
     // and we cannot know which of them is null/non-null.
     if (Ref.vars().size() != 1)
@@ -889,13 +858,13 @@ void PSetsBuilder::UpdatePSetsFromCondition(
     }
     FalseBranchExitPMap = PMap;
     (*FalseBranchExitPMap)[V] = PSElseBranch;
-    setPSet(PSet::singleton(V), PS, Loc);
+    updatePMap(PSet::singleton(V), PS, Loc);
   }
 } // namespace lifetime
 
 /// Checks if the statement S is a call to clang_analyzer_pset and, if yes,
 /// diags the pset of its argument
-bool PSetsBuilder::HandleClangAnalyzerPset(const CallExpr *CallE) {
+bool PSetsBuilder::handleClangAnalyzerPset(const CallExpr *CallE) {
 
   const FunctionDecl *Callee = CallE->getDirectCallee();
   if (!Callee)
@@ -963,15 +932,11 @@ static const Stmt *getRealTerminator(const CFGBlock &B) {
 // Update PSets in Builder through all CFGElements of this block
 void PSetsBuilder::VisitBlock(const CFGBlock &B,
                               llvm::Optional<PSetsMap> &FalseBranchExitPMap) {
-  for (auto i = B.begin(); i != B.end(); ++i) {
-    const CFGElement &E = *i;
+  for (auto &E : B) {
     switch (E.getKind()) {
     case CFGElement::Statement: {
       const Stmt *S = E.castAs<CFGStmt>().getStmt();
-      TraverseStmt(const_cast<Stmt *>(S));
-      /*llvm::errs() << "TraverseStmt\n";
-      S->dump();
-      llvm::errs() << "\n";*/
+      ConstStmtVisitor::Visit(S);
 
       // Kill all temporaries that vanish at the end of the full expression
       invalidateOwner(Variable::temporary(), 0,
@@ -1008,16 +973,15 @@ void PSetsBuilder::VisitBlock(const CFGBlock &B,
     }
   }
   if (auto *Terminator = getRealTerminator(B)) {
-    UpdatePSetsFromCondition(Terminator, /*Positive=*/true, FalseBranchExitPMap,
+    updatePSetsFromCondition(Terminator, /*Positive=*/true, FalseBranchExitPMap,
                              Terminator->getLocEnd());
   }
 }
 
 void VisitBlock(PSetsMap &PMap, llvm::Optional<PSetsMap> &FalseBranchExitPMap,
-                std::map<const Expr *, PSet> &PSetsOfExpr,
-                std::map<const Expr *, PSet> &RefersTo, const CFGBlock &B,
+                ExprPSets &SubExprPSets, const CFGBlock &B,
                 LifetimeReporterBase &Reporter, ASTContext &ASTCtxt) {
-  PSetsBuilder Builder(Reporter, ASTCtxt, PMap, PSetsOfExpr, RefersTo);
+  PSetsBuilder Builder(Reporter, ASTCtxt, PMap, SubExprPSets);
   Builder.VisitBlock(B, FalseBranchExitPMap);
 }
 

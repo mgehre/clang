@@ -86,7 +86,7 @@ public:
     }
   }
 
-  bool VisitDeclStmt(const DeclStmt* DS) {
+  bool VisitDeclStmt(const DeclStmt *DS) {
     for (const auto *DeclIt : DS->decls()) {
       if (const auto *VD = dyn_cast<VarDecl>(DeclIt))
         return VisitVarDecl(VD);
@@ -110,33 +110,28 @@ public:
     };
 
     if (auto *VD = dyn_cast<VarDecl>(DeclRef->getDecl())) {
-      RefersTo[DeclRef] = varRefersTo(VD->getType(), VD);
+      setPSet(DeclRef, varRefersTo(VD->getType(), VD));
     } else if (auto *FD = dyn_cast<FieldDecl>(DeclRef->getDecl())) {
       Variable V = Variable::thisPointer();
       V.addFieldRef(FD);
-      RefersTo[DeclRef] = varRefersTo(FD->getType(), V);
+      setPSet(DeclRef, varRefersTo(FD->getType(), V));
     }
 
     return true;
   }
 
   bool VisitMemberExpr(const MemberExpr *ME) {
-    PSet BaseRefersTo;
-    if (ME->getBase()->getType()->isPointerType()) {
-      // This is like a deref plus member expr.
-      BaseRefersTo = getPSet(ME->getBase());
+    PSet BaseRefersTo = getPSet(ME->getBase(), ME->getBase()->isLValue());
+    if (ME->getBase()->getType()->isPointerType())
       CheckPSetValidity(BaseRefersTo, ME->getExprLoc());
-    } else {
-      BaseRefersTo = RefersTo[ME->getBase()];
-    }
 
     if (auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {
       PSet Ret = BaseRefersTo;
       Ret.addFieldRef(FD);
-      RefersTo[ME] = Ret;
+      setPSet(ME, Ret);
     } else if (isa<VarDecl>(ME->getMemberDecl())) {
       // A static data member of this class
-      RefersTo[ME] = PSet::staticVar(false);
+      setPSet(ME, PSet::staticVar(false));
     }
 
     return true;
@@ -149,16 +144,15 @@ public:
         dyn_cast<DeclRefExpr>(E->getBase()->IgnoreParenImpCasts());
 
     // Unless we see the actual array, we assume it is pointer arithmetic.
-    auto &Ref = RefersTo[E];
-    Ref = PSet::invalid(InvalidationReason::PointerArithmetic(E->getExprLoc()));
-    if (!DeclRef)
-      return true;
-
-    const VarDecl *VD = dyn_cast<VarDecl>(DeclRef->getDecl());
-    assert(VD);
-    if (VD->getType().getCanonicalType()->isArrayType())
-      Ref = PSet::singleton(VD, false);
-
+    PSet Ref =
+        PSet::invalid(InvalidationReason::PointerArithmetic(E->getExprLoc()));
+    if (DeclRef) {
+      const VarDecl *VD = dyn_cast<VarDecl>(DeclRef->getDecl());
+      assert(VD);
+      if (VD->getType().getCanonicalType()->isArrayType())
+        Ref = PSet::singleton(VD, false);
+    }
+    setPSet(E, Ref);
     return true;
   }
 
@@ -168,23 +162,19 @@ public:
   }
 
   bool VisitConditionalOperator(const ConditionalOperator *E) {
-    if (E->isLValue())
-      RefersTo[E] = refersTo(E->getLHS()) + refersTo(E->getRHS());
-
-    if (hasPSet(E))
-      setPSet(E, getPSet(E->getLHS()) + getPSet(E->getRHS()));
-
+    bool IsRef = E->isLValue();
+    setPSet(E, getPSet(E->getLHS(), IsRef) + getPSet(E->getRHS(), IsRef));
     return true;
   }
 
   bool VisitMaterializeTemporaryExpr(const MaterializeTemporaryExpr *E) {
     if (E->getExtendingDecl()) {
       PSet Singleton = PSet::singleton(E, false, 0);
-      RefersTo[E] = Singleton;
+      setPSet(E, Singleton);
       if (hasPSet(E->GetTemporaryExpr()))
         setPSet(Singleton, getPSet(E->GetTemporaryExpr()), E->getLocStart());
     } else
-      RefersTo[E] = PSet::singleton(Variable::temporary(), false, 0);
+      setPSet(E, PSet::singleton(Variable::temporary(), false, 0));
     return true;
   }
 
@@ -213,17 +203,12 @@ public:
     case CK_BitCast:
     case CK_LValueBitCast:
     case CK_IntegralToPointer:
-      assert(!E->isLValue());
       // Those casts are forbidden by the type profile
       setPSet(
           E, PSet::invalid(InvalidationReason::ForbiddenCast(E->getExprLoc())));
       return true;
     default: {
-      if (E->isLValue())
-        RefersTo[E] = refersTo(E->getSubExpr());
-
-      if (hasPSet(E))
-        setPSet(E, getPSet(E->getSubExpr()));
+      setPSet(E, getPSet(E->getSubExpr(), E->isLValue()));
       return true;
     }
     }
@@ -239,10 +224,11 @@ public:
       // TODO
     } else if (TC == TypeCategory::Pointer) {
       // This assignment updates a Pointer
-      setPSet(refersTo(BO->getLHS()), getPSet(BO->getRHS()), BO->getExprLoc());
+      setPSet(getPSet(BO->getLHS(), true), getPSet(BO->getRHS()),
+              BO->getExprLoc());
     }
 
-    RefersTo[BO] = refersTo(BO->getLHS());
+    setPSet(BO, getPSet(BO->getLHS(), true));
     return true;
   }
 
@@ -264,7 +250,7 @@ public:
       return VisitUnaryDeref(UO);
     default:
       if (UO->getType()->isPointerType())
-        setPSet(refersTo(UO->getSubExpr()),
+        setPSet(getPSet(UO->getSubExpr(), true),
                 PSet::invalid(
                     InvalidationReason::PointerArithmetic(UO->getExprLoc())),
                 UO->getExprLoc());
@@ -274,7 +260,7 @@ public:
 
   bool VisitUnaryAddrOf(const UnaryOperator *UO) {
     if (hasPSet(UO))
-      setPSet(UO, refersTo(UO->getSubExpr()));
+      setPSet(UO, getPSet(UO->getSubExpr(), true));
     return true;
   }
 
@@ -282,7 +268,7 @@ public:
     auto PS = getPSet(UO->getSubExpr());
     CheckPSetValidity(PS, UO->getExprLoc());
 
-    RefersTo[UO] = PS;
+    setPSet(UO, PS);
     return true;
   }
 
@@ -302,19 +288,6 @@ public:
     if (isPointer(E))
       setPSet(E, PSet::null(E->getExprLoc()));
     return true;
-  }
-
-  // Returns the storage to which the expression refers to.
-  PSet refersTo(const Expr *E) {
-    assert(E->isLValue());
-    auto i = RefersTo.find(IgnoreParenImpCasts(E));
-    /*if (i == RefersTo.end())
-      return {};*/
-    if (i == RefersTo.end()) {
-      E->dump();
-      assert(i != RefersTo.end());
-    }
-    return i->second;
   }
 
   struct CallArgument {
@@ -353,7 +326,8 @@ public:
         }
       } else {
         // Type Category is Pointer due to raw references.
-        Args.Pin.emplace_back(Arg->getExprLoc(), refersTo(Arg), ParamQType);
+        Args.Pin.emplace_back(Arg->getExprLoc(), getPSet(Arg, true),
+                              ParamQType);
       }
 
     } else if (classifyTypeCategory(ParamQType) == TypeCategory::Pointer) {
@@ -579,22 +553,16 @@ public:
 
     // Enforce that pset() of each argument does not refer to a non-const
     // global Owner
-    auto computeRetPset = [&] {
-      PSet Ret;
-      for (CallArgument &CA : PinExtended) {
-        // llvm::errs() << " Pin PS:" << CA.PS.str() << "\n";
-        Ret.merge(CA.PS);
-      }
-      for (CallArgument &CA : Args.Oin) {
-        // llvm::errs() << " Oin PS:" << CA.PS.str() << "\n";
-        Ret.merge(CA.PS);
-      }
-      return Ret;
-    };
-    if (CallE->isLValue())
-      RefersTo[CallE] = computeRetPset();
-    else if (hasPSet(CallE))
-      setPSet(CallE, computeRetPset());
+    PSet Ret;
+    for (CallArgument &CA : PinExtended) {
+      // llvm::errs() << " Pin PS:" << CA.PS.str() << "\n";
+      Ret.merge(CA.PS);
+    }
+    for (CallArgument &CA : Args.Oin) {
+      // llvm::errs() << " Oin PS:" << CA.PS.str() << "\n";
+      Ret.merge(CA.PS);
+    }
+    setPSet(CallE, Ret);
     return true;
   }
 
@@ -618,18 +586,18 @@ public:
 
   PSet getPSet(Variable P);
 
-  PSet getPSet(const Expr *E) {
+  PSet getPSet(const Expr *E, bool OfReference = false) {
     E = IgnoreParenImpCasts(E);
-    assert(hasPSet(E));
-
-    auto i = PSetsOfExpr.find(E);
-    if (i != PSetsOfExpr.end())
-      return i->second;
-
-    // If we have no pset, we might still have a refersTo set for this
-    // expression. Then the pset of this expressions is the merged pset of
-    // everything that it refers to.
-    return getPSet(refersTo(E));
+    if (E->isLValue()) {
+      auto I = RefersTo.find(E);
+      assert(I != RefersTo.end());
+      return OfReference ? I->second : getPSet(I->second);
+    } else {
+      auto I = PSetsOfExpr.find(E);
+      if (I == PSetsOfExpr.end())
+        return PSet::singleton(Variable::temporary());
+      return I->second;
+    }
   }
 
   PSet getPSet(const PSet &P) {
@@ -646,12 +614,10 @@ public:
   }
 
   void setPSet(const Expr *E, PSet PS) {
-    assert(hasPSet(E));
-    auto I = PSetsOfExpr.find(E);
-    if (I != PSetsOfExpr.end())
-      I->second = std::move(PS);
+    if (E->isLValue())
+      RefersTo[E] = PS;
     else
-      PSetsOfExpr.emplace(E, PS);
+      PSetsOfExpr[E] = PS;
   }
   void setPSet(PSet LHS, PSet RHS, SourceLocation Loc);
   PSet derefPSet(PSet P, SourceLocation Loc);
@@ -683,10 +649,7 @@ public:
         // TODO: Better diagnostic that explains the array to pointer decay
         PS = PSet::invalid(InvalidationReason::PointerArithmetic(Loc));
       } else if (Initializer) {
-        if (VD->getType()->isReferenceType())
-          PS = refersTo(Initializer);
-        else
-          PS = getPSet(Initializer);
+        PS = getPSet(Initializer, VD->getType()->isReferenceType());
       } else {
         // Never treat local statics as uninitialized.
         if (VD->hasGlobalStorage())
@@ -854,17 +817,17 @@ void PSetsBuilder::UpdatePSetsFromCondition(
     if (!isPointer(LHS) || !isPointer(RHS))
       return;
 
-    if (LHS->isLValue() && getPSet(RHS).isNull())
+    if (getPSet(RHS).isNull())
       UpdatePSetsFromCondition(LHS, Positive, FalseBranchExitPMap,
                                E->getLocStart());
-    else if (RHS->isLValue() && getPSet(LHS).isNull())
+    else if (getPSet(LHS).isNull())
       UpdatePSetsFromCondition(RHS, Positive, FalseBranchExitPMap,
                                E->getLocStart());
     return;
   }
 
   if (E->isLValue() && hasPSet(E)) {
-    auto Ref = refersTo(E);
+    auto Ref = getPSet(E, true);
     // We refer to multiple variables (or none),
     // and we cannot know which of them is null/non-null.
     if (Ref.vars().size() != 1)

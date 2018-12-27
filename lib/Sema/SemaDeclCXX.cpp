@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/Analysis/Analyses/LifetimeTypeCategory.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTLambda.h"
@@ -3938,16 +3939,20 @@ static void CheckForDanglingReferenceOrPointer(Sema &S, ValueDecl *Member,
                                                Expr *Init,
                                                SourceLocation IdLoc) {
   QualType MemberTy = Member->getType();
+  lifetime::TypeClassification TC = lifetime::classifyTypeCategory(MemberTy);
 
   // We only handle pointers and references currently.
   // FIXME: Would this be relevant for ObjC object pointers? Or block pointers?
-  if (!MemberTy->isReferenceType() && !MemberTy->isPointerType())
+  if (TC != lifetime::TypeCategory::Pointer)
     return;
 
-  const bool IsPointer = MemberTy->isPointerType();
-  if (IsPointer) {
-    if (const UnaryOperator *Op
-          = dyn_cast<UnaryOperator>(Init->IgnoreParenImpCasts())) {
+  const bool IsReference = MemberTy->isReferenceType();
+  if (!IsReference) {
+    const Expr * E = Init->IgnoreParenImpCasts();
+    if (const auto *CE = dyn_cast<CXXConstructExpr>(E))
+      if (CE->getNumArgs() > 0)
+        E = CE->getArg(0);
+    if (const auto *Op = dyn_cast<UnaryOperator>(E)) {
       // The only case we're worried about with pointers requires taking the
       // address.
       if (Op->getOpcode() != UO_AddrOf)
@@ -3967,16 +3972,16 @@ static void CheckForDanglingReferenceOrPointer(Sema &S, ValueDecl *Member,
       return;
 
     S.Diag(Init->getExprLoc(),
-           IsPointer ? diag::warn_init_ptr_member_to_parameter_addr
-                     : diag::warn_bind_ref_member_to_parameter)
-      << Member << Parameter << Init->getSourceRange();
+           IsReference ? diag::warn_bind_ref_member_to_parameter
+                       : diag::warn_init_ptr_member_to_parameter_addr)
+        << Member << Parameter << Init->getSourceRange();
   } else {
     // Other initializers are fine.
     return;
   }
 
   S.Diag(Member->getLocation(), diag::note_ref_or_ptr_member_declared_here)
-    << (unsigned)IsPointer;
+    << (unsigned)!IsReference;
 }
 
 MemInitResult

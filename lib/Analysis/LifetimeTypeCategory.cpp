@@ -30,16 +30,26 @@ static FunctionDecl *lookupMemberFunction(const CXXRecordDecl *R,
 }
 
 template <typename T>
-static bool hasMethodLike(const CXXRecordDecl *R, T Predicate) {
+static bool hasMethodLike(const CXXRecordDecl *R, T Predicate,
+                          const CXXMethodDecl **FoundMD = nullptr) {
   // TODO cache IdentifierInfo to avoid string compare
-  auto CallBack = [Predicate](const CXXRecordDecl *Base) {
+  auto CallBack = [Predicate, FoundMD](const CXXRecordDecl *Base) {
     return std::none_of(
-        Base->decls_begin(), Base->decls_end(), [Predicate](const Decl *D) {
-          if (auto *M = dyn_cast<CXXMethodDecl>(D))
-            return Predicate(M);
+        Base->decls_begin(), Base->decls_end(),
+        [Predicate, FoundMD](const Decl *D) {
+          if (auto *M = dyn_cast<CXXMethodDecl>(D)) {
+            bool Found = Predicate(M);
+            if (Found && FoundMD)
+              *FoundMD = M;
+            return Found;
+          }
           if (auto *Tmpl = dyn_cast<FunctionTemplateDecl>(D)) {
-            if (auto *M = dyn_cast<CXXMethodDecl>(Tmpl->getTemplatedDecl()))
-              return Predicate(M);
+            if (auto *M = dyn_cast<CXXMethodDecl>(Tmpl->getTemplatedDecl())) {
+              bool Found = Predicate(M);
+              if (Found && FoundMD)
+                *FoundMD = M;
+              return Found;
+            }
           }
           return false;
         });
@@ -47,8 +57,19 @@ static bool hasMethodLike(const CXXRecordDecl *R, T Predicate) {
   return !R->forallBases(CallBack) || !CallBack(R);
 }
 
-static bool hasMethodWithNameAndArgNum(const CXXRecordDecl *R, StringRef Name,
-                                       int ArgNum = -1) {
+static bool hasOperator(const CXXRecordDecl *R, OverloadedOperatorKind Op,
+                        const CXXMethodDecl **FoundMD = nullptr) {
+  return hasMethodLike(R,
+                       [Op](const CXXMethodDecl *MD) {
+                         return MD->getOverloadedOperator() == Op;
+                       },
+                       FoundMD);
+}
+
+static bool
+hasMethodWithNameAndArgNum(const CXXRecordDecl *R, StringRef Name,
+                           int ArgNum = -1,
+                           const CXXMethodDecl **FoundMD = nullptr) {
   return hasMethodLike(R, [Name, ArgNum](const CXXMethodDecl *M) {
     if (ArgNum >= 0 && (unsigned)ArgNum != M->getMinRequiredArguments())
       return false;
@@ -56,7 +77,7 @@ static bool hasMethodWithNameAndArgNum(const CXXRecordDecl *R, StringRef Name,
     if (!I)
       return false;
     return I->getName() == Name;
-  });
+  }, FoundMD);
 }
 
 static bool satisfiesContainerRequirements(const CXXRecordDecl *R) {
@@ -89,7 +110,7 @@ static bool satisfiesRangeConcept(const CXXRecordDecl *R) {
 }
 
 static bool hasDerefOperations(const CXXRecordDecl *R) {
-  return lookupOperator(R, OO_Arrow) || lookupOperator(R, OO_Star);
+  return hasOperator(R, OO_Arrow) || hasOperator(R, OO_Star);
 }
 
 /// Determines if D is std::vector<bool>::reference
@@ -329,7 +350,8 @@ static QualType getPointeeType(const CXXRecordDecl *R) {
   assert(R);
 
   for (auto Op : {OO_Star, OO_Arrow, OO_Subscript}) {
-    if (auto *F = lookupOperator(R, Op)) {
+    const CXXMethodDecl *F;
+    if (hasOperator(R, Op, &F)) {
       auto PointeeType = F->getReturnType();
       if (PointeeType->isReferenceType() || PointeeType->isAnyPointerType())
         PointeeType = PointeeType->getPointeeType();
@@ -337,7 +359,8 @@ static QualType getPointeeType(const CXXRecordDecl *R) {
     }
   }
 
-  if (auto *F = lookupMemberFunction(R, "begin")) {
+  const CXXMethodDecl *F;
+  if (hasMethodWithNameAndArgNum(R, "begin", 0, &F)) {
     auto PointeeType = F->getReturnType();
     if (classifyTypeCategory(PointeeType) != TypeCategory::Pointer) {
 #if CLASSIFY_DEBUG

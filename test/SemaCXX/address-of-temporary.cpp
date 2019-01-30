@@ -10,6 +10,10 @@ void f1() { (void)&X(1); } // expected-warning{{taking the address of a temporar
 void f2() { (void)&X(1, 2); } // expected-warning{{taking the address of a temporary object}}
 void f3() { (void)&(X)1; } // expected-warning{{taking the address of a temporary object}}
 
+struct [[gsl::Pointer]] MyPointer {
+  MyPointer(int *p = 0);
+  int &operator*();
+};
 
 namespace PointerToArrayDecay {
   struct Y {
@@ -31,6 +35,7 @@ namespace PointerToArrayDecay {
   void g2() { int *p = A{}; } // expected-warning{{pointer is initialized by a temporary array}}
   void g3() { int *p = (A){}; } // expected-warning{{pointer is initialized by a temporary array}}
   void g4() { Z *p = AZ{}; } // expected-warning{{pointer is initialized by a temporary array}}
+  void g5() { MyPointer p = Y{}.a; } // expected-warning{{pointer is initialized by a temporary array}}
 
   void h0() { consume(Y().a); }
   void h1() { consume(Y{}.a); }

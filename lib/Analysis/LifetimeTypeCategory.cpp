@@ -210,8 +210,8 @@ static TypeClassification classifyTypeCategoryImpl(const Type *T) {
   }
 
   if (!R->hasDefinition()) {
-    if (auto *CDS = dyn_cast<ClassTemplateSpecializationDecl>(R))
-      GlobalDefineClassTemplateSpecialization(CDS);
+    /*if (auto *CDS = dyn_cast<ClassTemplateSpecializationDecl>(R))
+      GlobalDefineClassTemplateSpecialization(CDS);*/
   }
 
   if (!R->hasDefinition())
@@ -399,8 +399,9 @@ static QualType getPointeeTypeImpl(const Type *T) {
     return QualType(T, 0);
 
   if (!R->hasDefinition()) {
-    if (auto *CDS = dyn_cast<ClassTemplateSpecializationDecl>(R))
-      GlobalDefineClassTemplateSpecialization(CDS);
+    /*if (auto *CDS = dyn_cast<ClassTemplateSpecializationDecl>(R))
+      GlobalDefineClassTemplateSpecialization(CDS);*/
+    return {};
   }
 
   assert(R->hasDefinition());

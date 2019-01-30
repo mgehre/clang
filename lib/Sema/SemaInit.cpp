@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/Analysis/Analyses/LifetimeTypeCategory.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/ExprCXX.h"
@@ -6675,8 +6676,11 @@ InitializationSequence::Perform(Sema &S,
 
   // Diagnose cases where we initialize a pointer to an array temporary, and the
   // pointer obviously outlives the temporary.
-  if (Args.size() == 1 && Args[0]->getType()->isArrayType() &&
-      Entity.getType()->isPointerType() &&
+  lifetime::TypeClassification TC =
+      lifetime::classifyTypeCategory(Entity.getType());
+  if (Args.size() >= 1 && Args[0]->getType()->isArrayType() &&
+      TC == lifetime::TypeCategory::Pointer &&
+      !Entity.getType()->isReferenceType() &&
       InitializedEntityOutlivesFullExpression(Entity)) {
     const Expr *Init = Args[0]->skipRValueSubobjectAdjustments();
     if (auto *MTE = dyn_cast<MaterializeTemporaryExpr>(Init))

@@ -12,6 +12,7 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#include "clang/Analysis/Analyses/LifetimeTypeCategory.h"
 #include "clang/Sema/SemaInternal.h"
 #include "TreeTransform.h"
 #include "TypeLocBuilder.h"
@@ -1869,6 +1870,20 @@ Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
     Diag(AllocTypeInfo->getTypeLoc().getBeginLoc(),
          diag::warn_dangling_std_initializer_list)
         << /*at end of FE*/0 << Inits[0]->getSourceRange();
+  }
+
+  lifetime::TypeClassification TC = lifetime::TypeCategory::Value;
+  if (!AllocType->isDependentType())
+    TC = lifetime::classifyTypeCategory(AllocType);
+  if (NumInits > 0 && TC == lifetime::TypeCategory::Pointer) {
+    const Expr *Init = Inits[0]->skipRValueSubobjectAdjustments();
+    if (auto *MTE = dyn_cast<MaterializeTemporaryExpr>(Init))
+      Init = MTE->GetTemporaryExpr();
+    Expr::LValueClassification Kind = Init->ClassifyLValue(Context);
+    if (Kind == Expr::LV_ClassTemporary || Kind == Expr::LV_ArrayTemporary)
+      Diag(AllocTypeInfo->getTypeLoc().getBeginLoc(),
+           diag::warn_dangling_lifetime_pointer)
+          << Inits[0]->getSourceRange();
   }
 
   // In ARC, infer 'retaining' for the allocated

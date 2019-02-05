@@ -2054,7 +2054,7 @@ def warn_dangling_std_initializer_list : Warning<
   "%select{the full-expression|the constructor}0">,
   InGroup<DiagGroup<"dangling-initializer-list">>;
 def warn_dangling_lifetime_pointer : Warning<
-  "object backing the pointer will be destroyed at the end of the"
+  "object backing the pointer will be destroyed at the end of the "
   "full-expression">,
   InGroup<DiagGroup<"dangling-lifetime-pointer">>;
 def err_auto_init_list_from_c : Error<

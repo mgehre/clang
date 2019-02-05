@@ -1878,9 +1878,14 @@ Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
   if (NumInits > 0 && TC == lifetime::TypeCategory::Pointer) {
     const Expr *Init = Inits[0]->skipRValueSubobjectAdjustments();
     if (auto *MTE = dyn_cast<MaterializeTemporaryExpr>(Init))
-      Init = MTE->GetTemporaryExpr();
+      Init = MTE->GetTemporaryExpr()->IgnoreCasts()->IgnoreConversionOperator();
+    QualType SourceType = Init->getType();
+    lifetime::TypeClassification SourceTC = lifetime::TypeCategory::Value;
+    if (!SourceType->isDependentType())
+      SourceTC = lifetime::classifyTypeCategory(SourceType);
     Expr::LValueClassification Kind = Init->ClassifyLValue(Context);
-    if (Kind == Expr::LV_ClassTemporary || Kind == Expr::LV_ArrayTemporary)
+    if (SourceTC != lifetime::TypeCategory::Pointer &&
+        (Kind == Expr::LV_ClassTemporary || Kind == Expr::LV_ArrayTemporary))
       Diag(AllocTypeInfo->getTypeLoc().getBeginLoc(),
            diag::warn_dangling_lifetime_pointer)
           << Inits[0]->getSourceRange();

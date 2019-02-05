@@ -1872,7 +1872,7 @@ Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
         << /*at end of FE*/0 << Inits[0]->getSourceRange();
   }
 
-  lifetime::TypeClassification TC = lifetime::TypeCategory::Value;
+  /*lifetime::TypeClassification TC = lifetime::TypeCategory::Value;
   if (!AllocType->isDependentType())
     TC = lifetime::classifyTypeCategory(AllocType);
   if (NumInits > 0 && TC == lifetime::TypeCategory::Pointer) {
@@ -1884,12 +1884,12 @@ Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
     if (!SourceType->isDependentType())
       SourceTC = lifetime::classifyTypeCategory(SourceType);
     Expr::LValueClassification Kind = Init->ClassifyLValue(Context);
-    if (SourceTC != lifetime::TypeCategory::Pointer &&
+    if (SourceTC == lifetime::TypeCategory::Owner &&
         (Kind == Expr::LV_ClassTemporary || Kind == Expr::LV_ArrayTemporary))
       Diag(AllocTypeInfo->getTypeLoc().getBeginLoc(),
            diag::warn_dangling_lifetime_pointer)
           << Inits[0]->getSourceRange();
-  }
+  }*/
 
   // In ARC, infer 'retaining' for the allocated
   if (getLangOpts().ObjCAutoRefCount &&

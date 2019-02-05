@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -fsyntax-only -verify -Wdangling-lifetime-pointer -Waddress-of-temporary %s
+// RUN: %clang_cc1 -fsyntax-only -Wdangling-lifetime-pointer -Waddress-of-temporary -verify %s
 struct [[gsl::Owner]] MyOwner {
   int &operator*();
 };
@@ -9,8 +9,9 @@ struct [[gsl::Pointer]] MyPointer {
   int &operator*();
 };
 
-struct T {
+struct [[gsl::Owner]] T {
   operator MyPointer(); 
+  int &operator*();
 };
 
 void f() {
@@ -20,8 +21,8 @@ void f() {
 
 void g() {
   int i;
-  MyPointer p{&i}; // no-warning
-  new MyPointer(MyPointer{p}); // no-warning
+  MyPointer p{&i}; // ok
+  new MyPointer(MyPointer{p}); // ok
 }
 
 struct Y {
@@ -29,7 +30,7 @@ struct Y {
 };
 
 void h() {
-  MyPointer p = Y{}.a; // expected-warning{{pointer is initialized by a temporary array}}
+  MyPointer p = Y{}.a; // expected-warning {{pointer is initialized by a temporary array}}
   (void)p;
 }
 
@@ -37,8 +38,8 @@ struct S {
   MyPointer p; // expected-note {{pointer member declared here}}
   S(int i)
     : p(&i) {} // expected-warning {{initializing pointer member 'p' with the stack address of parameter 'i'}}
-  S() : p(T{}) {}
-  S(double) : p(MyOwner{}) {} // TODO
+  S() : p(T{}) {} // expected-warning {{object backing the pointer will be destroyed at the end of the full-expression}}
+  S(double) : p(MyOwner{}) {} // expected-warning {{object backing the pointer will be destroyed at the end of the full-expression}}
 };
 
 MyPointer i() {
@@ -49,7 +50,7 @@ MyPointer i() {
 MyPointer global;
 
 void j() {
-  MyPointer p = MyOwner{}; // TODO
+  MyPointer p = MyOwner{}; // expected-warning {{object backing the pointer will be destroyed at the end of the full-expression}}
   p = MyOwner{}; // TODO ?
   global = MyOwner{}; // TODO ?
 }

@@ -6678,17 +6678,24 @@ InitializationSequence::Perform(Sema &S,
   // pointer obviously outlives the temporary.
   lifetime::TypeClassification TC =
       lifetime::classifyTypeCategory(Entity.getType());
-  if (Args.size() >= 1 && Args[0]->getType()->isArrayType() &&
-      TC == lifetime::TypeCategory::Pointer &&
+  if (Args.size() >= 1 && TC == lifetime::TypeCategory::Pointer &&
       !Entity.getType()->isReferenceType() &&
+      !Args[0]->getType()->isPlaceholderType() &&
       InitializedEntityOutlivesFullExpression(Entity)) {
     const Expr *Init = Args[0]->skipRValueSubobjectAdjustments();
     if (auto *MTE = dyn_cast<MaterializeTemporaryExpr>(Init))
       Init = MTE->GetTemporaryExpr();
-    Expr::LValueClassification Kind = Init->ClassifyLValue(S.Context);
-    if (Kind == Expr::LV_ClassTemporary || Kind == Expr::LV_ArrayTemporary)
-      S.Diag(Init->getLocStart(), diag::warn_temporary_array_to_pointer_decay)
-        << Init->getSourceRange();
+    lifetime::TypeClassification SourceTC =
+        lifetime::classifyTypeCategory(Init->getType());
+    Expr::LValueClassification VKind = Init->ClassifyLValue(S.Context);
+    if (VKind == Expr::LV_ClassTemporary || VKind == Expr::LV_ArrayTemporary) {
+      if (Args[0]->getType()->isArrayType())
+        S.Diag(Init->getLocStart(), diag::warn_temporary_array_to_pointer_decay)
+            << Init->getSourceRange();
+      else if (SourceTC == lifetime::TypeCategory::Owner)
+        S.Diag(Kind.getLocation(), diag::warn_dangling_lifetime_pointer)
+            << Args[0]->getSourceRange();
+    }
   }
 
   QualType DestType = Entity.getType().getNonReferenceType();

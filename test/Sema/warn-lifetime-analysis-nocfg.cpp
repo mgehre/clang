@@ -36,8 +36,7 @@ void h() {
 
 struct S {
   MyPointer p; // expected-note {{pointer member declared here}}
-  S(int i)
-    : p(&i) {} // expected-warning {{initializing pointer member 'p' with the stack address of parameter 'i'}}
+  S(int i) : p(&i) {} // expected-warning {{initializing pointer member 'p' with the stack address of parameter 'i'}}
   S() : p(T{}) {} // expected-warning {{object backing the pointer will be destroyed at the end of the full-expression}}
   S(double) : p(MyOwner{}) {} // expected-warning {{object backing the pointer will be destroyed at the end of the full-expression}}
 };
@@ -53,4 +52,16 @@ void j() {
   MyPointer p = MyOwner{}; // expected-warning {{object backing the pointer will be destroyed at the end of the full-expression}}
   p = MyOwner{}; // TODO ?
   global = MyOwner{}; // TODO ?
+  p = T{}; // TODO ?
+  global = T{}; // TODO ?
+}
+
+struct IntVector {
+  int *begin();
+  int *end();
+};
+
+void future_work() {
+  int *it = IntVector{}.begin(); // TODO ?
+  (void)it;
 }

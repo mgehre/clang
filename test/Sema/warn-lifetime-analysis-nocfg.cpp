@@ -43,7 +43,12 @@ struct S {
 
 MyPointer i() {
   int j;
-  return &j; // TODO
+  return &j; // expected-warning {{address of stack memory associated with local variable 'j' returned}}
+}
+
+MyPointer i2() {
+  T t;
+  return t; // TODO
 }
 
 MyPointer global;

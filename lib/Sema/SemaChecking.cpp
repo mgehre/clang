@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/Analysis/Analyses/LifetimeTypeCategory.h"
 #include "clang/AST/APValue.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
@@ -9148,10 +9149,10 @@ void Sema::CheckStrncatArguments(const CallExpr *CE,
 
 static const Expr *EvalVal(const Expr *E,
                            SmallVectorImpl<const DeclRefExpr *> &refVars,
-                           const Decl *ParentDecl);
+                           const Decl *ParentDecl, bool OwnerOnly);
 static const Expr *EvalAddr(const Expr *E,
                             SmallVectorImpl<const DeclRefExpr *> &refVars,
-                            const Decl *ParentDecl);
+                            const Decl *ParentDecl, bool OwnerOnly);
 
 /// CheckReturnStackAddr - Check if a return statement returns the address
 ///   of a stack variable.
@@ -9161,13 +9162,17 @@ CheckReturnStackAddr(Sema &S, Expr *RetValExp, QualType lhsType,
   const Expr *stackE = nullptr;
   SmallVector<const DeclRefExpr *, 8> refVars;
 
+  lifetime::TypeClassification TC = lifetime::TypeCategory::Value;
+  if (!lhsType->isDependentType())
+    TC = lifetime::classifyTypeCategory(lhsType);
   // Perform checking for returned stack addresses, local blocks,
   // label addresses or references to temporaries.
   if (lhsType->isPointerType() ||
+      (TC == lifetime::TypeCategory::Pointer && !lhsType->isReferenceType()) ||
       (!S.getLangOpts().ObjCAutoRefCount && lhsType->isBlockPointerType())) {
-    stackE = EvalAddr(RetValExp, refVars, /*ParentDecl=*/nullptr);
+    stackE = EvalAddr(RetValExp, refVars, /*ParentDecl=*/nullptr, false);
   } else if (lhsType->isReferenceType()) {
-    stackE = EvalVal(RetValExp, refVars, /*ParentDecl=*/nullptr);
+    stackE = EvalVal(RetValExp, refVars, /*ParentDecl=*/nullptr, false);
   }
 
   if (!stackE)
@@ -9255,14 +9260,17 @@ CheckReturnStackAddr(Sema &S, Expr *RetValExp, QualType lhsType,
 ///   * taking the address of an array element where the array is on the stack
 static const Expr *EvalAddr(const Expr *E,
                             SmallVectorImpl<const DeclRefExpr *> &refVars,
-                            const Decl *ParentDecl) {
+                            const Decl *ParentDecl, bool OwnerOnly) {
   if (E->isTypeDependent())
     return nullptr;
 
+  QualType ExprType = E->getType();
+  lifetime::TypeClassification TC = lifetime::classifyTypeCategory(ExprType);
+
   // We should only be called for evaluating pointer expressions.
-  assert((E->getType()->isAnyPointerType() ||
-          E->getType()->isBlockPointerType() ||
-          E->getType()->isObjCQualifiedIdType()) &&
+  assert((ExprType->isAnyPointerType() || ExprType->isBlockPointerType() ||
+          ExprType->isObjCQualifiedIdType() ||
+          TC == lifetime::TypeCategory::Pointer) &&
          "EvalAddr only works on pointers");
 
   E = E->IgnoreParens();
@@ -9285,7 +9293,7 @@ static const Expr *EvalAddr(const Expr *E,
           V->getType()->isReferenceType() && V->hasInit()) {
         // Add the reference variable to the "trail".
         refVars.push_back(DR);
-        return EvalAddr(V->getInit(), refVars, ParentDecl);
+        return EvalAddr(V->getInit(), refVars, ParentDecl, OwnerOnly);
       }
 
     return nullptr;
@@ -9297,7 +9305,7 @@ static const Expr *EvalAddr(const Expr *E,
     const UnaryOperator *U = cast<UnaryOperator>(E);
 
     if (U->getOpcode() == UO_AddrOf)
-      return EvalVal(U->getSubExpr(), refVars, ParentDecl);
+      return EvalVal(U->getSubExpr(), refVars, ParentDecl, false);
     return nullptr;
   }
 
@@ -9318,7 +9326,7 @@ static const Expr *EvalAddr(const Expr *E,
       Base = B->getRHS();
 
     assert(Base->getType()->isPointerType());
-    return EvalAddr(Base, refVars, ParentDecl);
+    return EvalAddr(Base, refVars, ParentDecl, OwnerOnly);
   }
 
   // For conditional operators we need to see if either the LHS or RHS are
@@ -9331,7 +9339,7 @@ static const Expr *EvalAddr(const Expr *E,
     if (const Expr *LHSExpr = C->getLHS()) {
       // In C++, we can have a throw-expression, which has 'void' type.
       if (!LHSExpr->getType()->isVoidType())
-        if (const Expr *LHS = EvalAddr(LHSExpr, refVars, ParentDecl))
+        if (const Expr *LHS = EvalAddr(LHSExpr, refVars, ParentDecl, OwnerOnly))
           return LHS;
     }
 
@@ -9339,7 +9347,7 @@ static const Expr *EvalAddr(const Expr *E,
     if (C->getRHS()->getType()->isVoidType())
       return nullptr;
 
-    return EvalAddr(C->getRHS(), refVars, ParentDecl);
+    return EvalAddr(C->getRHS(), refVars, ParentDecl, OwnerOnly);
   }
 
   case Stmt::BlockExprClass:
@@ -9352,7 +9360,7 @@ static const Expr *EvalAddr(const Expr *E,
 
   case Stmt::ExprWithCleanupsClass:
     return EvalAddr(cast<ExprWithCleanups>(E)->getSubExpr(), refVars,
-                    ParentDecl);
+                    ParentDecl, OwnerOnly);
 
   // For casts, we need to handle conversions from arrays to
   // pointer values, and pointer-to-pointer conversions.
@@ -9375,16 +9383,17 @@ static const Expr *EvalAddr(const Expr *E,
     case CK_CPointerToObjCPointerCast:
     case CK_BlockPointerToObjCPointerCast:
     case CK_AnyPointerToBlockPointerCast:
-      return EvalAddr(SubExpr, refVars, ParentDecl);
+    case CK_ConstructorConversion:
+      return EvalAddr(SubExpr, refVars, ParentDecl, OwnerOnly);
 
     case CK_ArrayToPointerDecay:
-      return EvalVal(SubExpr, refVars, ParentDecl);
+      return EvalVal(SubExpr, refVars, ParentDecl, OwnerOnly);
 
     case CK_BitCast:
       if (SubExpr->getType()->isAnyPointerType() ||
           SubExpr->getType()->isBlockPointerType() ||
           SubExpr->getType()->isObjCQualifiedIdType())
-        return EvalAddr(SubExpr, refVars, ParentDecl);
+        return EvalAddr(SubExpr, refVars, ParentDecl, OwnerOnly);
       else
         return nullptr;
 
@@ -9396,9 +9405,25 @@ static const Expr *EvalAddr(const Expr *E,
   case Stmt::MaterializeTemporaryExprClass:
     if (const Expr *Result =
             EvalAddr(cast<MaterializeTemporaryExpr>(E)->GetTemporaryExpr(),
-                     refVars, ParentDecl))
+                     refVars, ParentDecl, OwnerOnly))
       return Result;
     return E;
+
+  case Stmt::CXXConstructExprClass: {
+    // Constructing a class with Pointer type category
+    auto skipTemp = [](const Expr *E) -> const Expr * {
+      if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(E))
+        return MTE->GetTemporaryExpr();
+      return E;
+    };
+    const auto *CXXCE = cast<CXXConstructExpr>(E);
+    if (CXXCE->getNumArgs() == 0)
+      return nullptr;
+    if (CXXCE->getArg(0)->isLValue())
+      return EvalVal(skipTemp(CXXCE->getArg(0)), refVars, ParentDecl, true);
+    else
+      return EvalAddr(skipTemp(CXXCE->getArg(0)), refVars, ParentDecl, true);
+  }
 
   // Everything else: we simply don't reason about them.
   default:
@@ -9410,7 +9435,8 @@ static const Expr *EvalAddr(const Expr *E,
 ///   See the comments for EvalAddr for more details.
 static const Expr *EvalVal(const Expr *E,
                            SmallVectorImpl<const DeclRefExpr *> &refVars,
-                           const Decl *ParentDecl) {
+                           const Decl *ParentDecl, bool OwnerOnly) {
+
   do {
     // We should only be called for evaluating non-pointer expressions, or
     // expressions with a pointer type that are not used as references but
@@ -9434,7 +9460,7 @@ static const Expr *EvalVal(const Expr *E,
 
     case Stmt::ExprWithCleanupsClass:
       return EvalVal(cast<ExprWithCleanups>(E)->getSubExpr(), refVars,
-                     ParentDecl);
+                     ParentDecl, OwnerOnly);
 
     case Stmt::DeclRefExprClass: {
       // When we hit a DeclRefExpr we are looking at code that refers to a
@@ -9447,20 +9473,26 @@ static const Expr *EvalVal(const Expr *E,
         return nullptr;
 
       if (const VarDecl *V = dyn_cast<VarDecl>(DR->getDecl())) {
+        QualType VT = V->getType();
+        lifetime::TypeClassification TC = lifetime::classifyTypeCategory(VT);
         // Check if it refers to itself, e.g. "int& i = i;".
         if (V == ParentDecl)
-          return DR;
+          return OwnerOnly
+                     ? (TC == lifetime::TypeCategory::Owner ? DR : nullptr)
+                     : DR;
 
         if (V->hasLocalStorage()) {
           if (!V->getType()->isReferenceType())
-            return DR;
+            return OwnerOnly
+                       ? (TC == lifetime::TypeCategory::Owner ? DR : nullptr)
+                       : DR;
 
           // Reference variable, follow through to the expression that
           // it points to.
           if (V->hasInit()) {
             // Add the reference variable to the "trail".
             refVars.push_back(DR);
-            return EvalVal(V->getInit(), refVars, V);
+            return EvalVal(V->getInit(), refVars, V, OwnerOnly);
           }
         }
       }
@@ -9475,7 +9507,7 @@ static const Expr *EvalVal(const Expr *E,
       const UnaryOperator *U = cast<UnaryOperator>(E);
 
       if (U->getOpcode() == UO_Deref)
-        return EvalAddr(U->getSubExpr(), refVars, ParentDecl);
+        return EvalAddr(U->getSubExpr(), refVars, ParentDecl, OwnerOnly);
 
       return nullptr;
     }
@@ -9487,12 +9519,12 @@ static const Expr *EvalVal(const Expr *E,
       const auto *ASE = cast<ArraySubscriptExpr>(E);
       if (ASE->isTypeDependent())
         return nullptr;
-      return EvalAddr(ASE->getBase(), refVars, ParentDecl);
+      return EvalAddr(ASE->getBase(), refVars, ParentDecl, OwnerOnly);
     }
 
     case Stmt::OMPArraySectionExprClass: {
       return EvalAddr(cast<OMPArraySectionExpr>(E)->getBase(), refVars,
-                      ParentDecl);
+                      ParentDecl, OwnerOnly);
     }
 
     case Stmt::ConditionalOperatorClass: {
@@ -9504,7 +9536,7 @@ static const Expr *EvalVal(const Expr *E,
       if (const Expr *LHSExpr = C->getLHS()) {
         // In C++, we can have a throw-expression, which has 'void' type.
         if (!LHSExpr->getType()->isVoidType())
-          if (const Expr *LHS = EvalVal(LHSExpr, refVars, ParentDecl))
+          if (const Expr *LHS = EvalVal(LHSExpr, refVars, ParentDecl, OwnerOnly))
             return LHS;
       }
 
@@ -9512,7 +9544,7 @@ static const Expr *EvalVal(const Expr *E,
       if (C->getRHS()->getType()->isVoidType())
         return nullptr;
 
-      return EvalVal(C->getRHS(), refVars, ParentDecl);
+      return EvalVal(C->getRHS(), refVars, ParentDecl, OwnerOnly);
     }
 
     // Accesses to members are potential references to data on the stack.
@@ -9529,13 +9561,13 @@ static const Expr *EvalVal(const Expr *E,
       if (M->getMemberDecl()->getType()->isReferenceType())
         return nullptr;
 
-      return EvalVal(M->getBase(), refVars, ParentDecl);
+      return EvalVal(M->getBase(), refVars, ParentDecl, OwnerOnly);
     }
 
     case Stmt::MaterializeTemporaryExprClass:
       if (const Expr *Result =
               EvalVal(cast<MaterializeTemporaryExpr>(E)->GetTemporaryExpr(),
-                      refVars, ParentDecl))
+                      refVars, ParentDecl, OwnerOnly))
         return Result;
       return E;
 

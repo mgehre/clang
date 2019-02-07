@@ -51,6 +51,10 @@ MyPointer i2() {
   return t; // TODO
 }
 
+MyPointer i3() {
+  return T{}; // expected-warning {{object backing the pointer will be destroyed at the end of the full-expression}}
+}
+
 MyPointer global;
 
 void j() {

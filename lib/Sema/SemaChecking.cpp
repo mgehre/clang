@@ -9384,6 +9384,7 @@ static const Expr *EvalAddr(const Expr *E,
     case CK_BlockPointerToObjCPointerCast:
     case CK_AnyPointerToBlockPointerCast:
     case CK_ConstructorConversion:
+    case CK_UserDefinedConversion:
       return EvalAddr(SubExpr, refVars, ParentDecl, OwnerOnly);
 
     case CK_ArrayToPointerDecay:
@@ -9402,12 +9403,15 @@ static const Expr *EvalAddr(const Expr *E,
     }
   }
 
-  case Stmt::MaterializeTemporaryExprClass:
+  case Stmt::MaterializeTemporaryExprClass: {
     if (const Expr *Result =
             EvalAddr(cast<MaterializeTemporaryExpr>(E)->GetTemporaryExpr(),
                      refVars, ParentDecl, OwnerOnly))
       return Result;
-    return E;
+    lifetime::TypeClassification TC =
+        lifetime::classifyTypeCategory(E->getType());
+    return OwnerOnly && TC != lifetime::TypeCategory::Owner ? nullptr : E;
+  }
 
   case Stmt::CXXConstructExprClass: {
     // Constructing a class with Pointer type category
@@ -9423,6 +9427,15 @@ static const Expr *EvalAddr(const Expr *E,
       return EvalVal(skipTemp(CXXCE->getArg(0)), refVars, ParentDecl, true);
     else
       return EvalAddr(skipTemp(CXXCE->getArg(0)), refVars, ParentDecl, true);
+  }
+
+  case Stmt::CXXMemberCallExprClass: {
+    // Constructing a class with Pointer type category through conversion
+    const auto *CXXMCE = cast<CXXMemberCallExpr>(E);
+    if (CXXMCE->getType()->isReferenceType())
+      return nullptr;
+    return EvalVal(CXXMCE->getImplicitObjectArgument(), refVars, ParentDecl,
+                   true);
   }
 
   // Everything else: we simply don't reason about them.
@@ -9477,15 +9490,13 @@ static const Expr *EvalVal(const Expr *E,
         lifetime::TypeClassification TC = lifetime::classifyTypeCategory(VT);
         // Check if it refers to itself, e.g. "int& i = i;".
         if (V == ParentDecl)
-          return OwnerOnly
-                     ? (TC == lifetime::TypeCategory::Owner ? DR : nullptr)
-                     : DR;
+          return OwnerOnly && TC != lifetime::TypeCategory::Owner ? nullptr
+                                                                  : DR;
 
         if (V->hasLocalStorage()) {
           if (!V->getType()->isReferenceType())
-            return OwnerOnly
-                       ? (TC == lifetime::TypeCategory::Owner ? DR : nullptr)
-                       : DR;
+            return OwnerOnly && TC != lifetime::TypeCategory::Owner ? nullptr
+                                                                    : DR;
 
           // Reference variable, follow through to the expression that
           // it points to.
@@ -9564,18 +9575,27 @@ static const Expr *EvalVal(const Expr *E,
       return EvalVal(M->getBase(), refVars, ParentDecl, OwnerOnly);
     }
 
-    case Stmt::MaterializeTemporaryExprClass:
+    case Stmt::MaterializeTemporaryExprClass: {
       if (const Expr *Result =
               EvalVal(cast<MaterializeTemporaryExpr>(E)->GetTemporaryExpr(),
                       refVars, ParentDecl, OwnerOnly))
         return Result;
-      return E;
+      lifetime::TypeClassification TC =
+          lifetime::classifyTypeCategory(E->getType());
+      return OwnerOnly && TC != lifetime::TypeCategory::Owner ? nullptr : E;
+    }
+
+    case Stmt::CXXThisExprClass:
+      return nullptr;
 
     default:
       // Check that we don't return or take the address of a reference to a
       // temporary. This is only useful in C++.
-      if (!E->isTypeDependent() && E->isRValue())
-        return E;
+      if (!E->isTypeDependent() && E->isRValue()) {
+        lifetime::TypeClassification TC =
+            lifetime::classifyTypeCategory(E->getType());
+        return OwnerOnly && TC != lifetime::TypeCategory::Owner ? nullptr : E;
+      }
 
       // Everything else: we simply don't reason about them.
       return nullptr;

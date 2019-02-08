@@ -48,11 +48,13 @@ MyPointer i() {
 
 MyPointer i2() {
   T t;
-  return t; // TODO
+  return t; // expected-warning {{address of stack memory associated with local variable 't' returned}}
+            // TODO: other warning message, the address of the object pointed by 't' is returned.
 }
 
 MyPointer i3() {
   return T{}; // expected-warning {{object backing the pointer will be destroyed at the end of the full-expression}}
+              // expected-warning@-1 {{returning address of local temporary object}}
 }
 
 MyPointer global;

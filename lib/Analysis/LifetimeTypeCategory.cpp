@@ -58,9 +58,13 @@ static bool hasMethodLike(const CXXRecordDecl *R, T Predicate,
 }
 
 static bool hasOperator(const CXXRecordDecl *R, OverloadedOperatorKind Op,
+                        int NumParams = -1,
                         const CXXMethodDecl **FoundMD = nullptr) {
   return hasMethodLike(R,
-                       [Op](const CXXMethodDecl *MD) {
+                       [Op, NumParams](const CXXMethodDecl *MD) {
+                         if (NumParams != -1 &&
+                             NumParams != (int)MD->param_size())
+                           return false;
                          return MD->getOverloadedOperator() == Op;
                        },
                        FoundMD);
@@ -110,7 +114,7 @@ static bool satisfiesRangeConcept(const CXXRecordDecl *R) {
 }
 
 static bool hasDerefOperations(const CXXRecordDecl *R) {
-  return hasOperator(R, OO_Arrow) || hasOperator(R, OO_Star);
+  return hasOperator(R, OO_Arrow, 0) || hasOperator(R, OO_Star, 0);
 }
 
 /// Determines if D is std::vector<bool>::reference
@@ -138,7 +142,14 @@ static Optional<TypeCategory> classifyStd(const Type *T) {
                                        "optional", "_Ptr_base"};
   static std::set<StringRef> StdPointers{"basic_regex", "reference_wrapper"};
   auto *Decl = T->getAsCXXRecordDecl();
-  if (!Decl || !Decl->isInStdNamespace() || !Decl->getIdentifier())
+  if (!Decl || !Decl->getIdentifier())
+    return {};
+
+  // Temporary hack for LLVM.
+  if (Decl->getName() == "Optional")
+    return TypeCategory::Owner;
+
+  if (!Decl->isInStdNamespace())
     return {};
 
   if (StdOwners.count(Decl->getName()))
@@ -348,10 +359,11 @@ bool isNullableType(QualType QT) {
 
 static QualType getPointeeType(const CXXRecordDecl *R) {
   assert(R);
-
-  for (auto Op : {OO_Star, OO_Arrow, OO_Subscript}) {
+  std::pair<OverloadedOperatorKind, int> Ops[] = {
+      {OO_Star, 0}, {OO_Arrow, 0}, {OO_Subscript, -1}};
+  for (auto P : Ops) {
     const CXXMethodDecl *F;
-    if (hasOperator(R, Op, &F)) {
+    if (hasOperator(R, P.first, P.second, &F)) {
       auto PointeeType = F->getReturnType();
       if (PointeeType->isReferenceType() || PointeeType->isAnyPointerType())
         PointeeType = PointeeType->getPointeeType();

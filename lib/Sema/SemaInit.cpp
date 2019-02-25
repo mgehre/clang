@@ -6685,16 +6685,20 @@ InitializationSequence::Perform(Sema &S,
     const Expr *Init = Args[0]->skipRValueSubobjectAdjustments();
     if (auto *MTE = dyn_cast<MaterializeTemporaryExpr>(Init))
       Init = MTE->GetTemporaryExpr();
-    lifetime::TypeClassification SourceTC =
-        lifetime::classifyTypeCategory(Init->getType());
-    Expr::LValueClassification VKind = Init->ClassifyLValue(S.Context);
-    if (VKind == Expr::LV_ClassTemporary || VKind == Expr::LV_ArrayTemporary) {
-      if (Args[0]->getType()->isArrayType())
-        S.Diag(Init->getLocStart(), diag::warn_temporary_array_to_pointer_decay)
-            << Init->getSourceRange();
-      else if (SourceTC == lifetime::TypeCategory::Owner)
-        S.Diag(Kind.getLocation(), diag::warn_dangling_lifetime_pointer)
-            << Args[0]->getSourceRange();
+    if (!Init->getType()->isDependentType()) {
+      lifetime::TypeClassification SourceTC =
+          lifetime::classifyTypeCategory(Init->getType());
+      Expr::LValueClassification VKind = Init->ClassifyLValue(S.Context);
+      if (VKind == Expr::LV_ClassTemporary ||
+          VKind == Expr::LV_ArrayTemporary) {
+        if (Args[0]->getType()->isArrayType())
+          S.Diag(Init->getLocStart(),
+                 diag::warn_temporary_array_to_pointer_decay)
+              << Init->getSourceRange();
+        else if (SourceTC == lifetime::TypeCategory::Owner)
+          S.Diag(Kind.getLocation(), diag::warn_dangling_lifetime_pointer)
+              << Args[0]->getSourceRange();
+      }
     }
   }
 

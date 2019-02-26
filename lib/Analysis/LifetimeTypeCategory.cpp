@@ -372,6 +372,13 @@ static QualType getPointeeType(const CXXRecordDecl *R) {
     }
   }
 
+  for(auto D : R->decls()) {
+    if (const auto *TypeDef = dyn_cast<TypedefNameDecl>(D)) {
+      if (TypeDef->getName() == "value_type")
+        return TypeDef->getUnderlyingType().getCanonicalType();
+    }
+  }
+
   const CXXMethodDecl *F;
   if (hasMethodWithNameAndArgNum(R, "begin", 0, &F)) {
     auto PointeeType = F->getReturnType();

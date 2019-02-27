@@ -9266,7 +9266,7 @@ static const Expr *EvalAddr(const Expr *E,
 
   QualType ExprType = E->getType();
   lifetime::TypeClassification TC = lifetime::classifyTypeCategory(ExprType);
-
+  
   // We should only be called for evaluating pointer expressions.
   assert((ExprType->isAnyPointerType() || ExprType->isBlockPointerType() ||
           ExprType->isObjCQualifiedIdType() ||
@@ -9374,6 +9374,13 @@ static const Expr *EvalAddr(const Expr *E,
   case Stmt::CXXReinterpretCastExprClass: {
     const Expr* SubExpr = cast<CastExpr>(E)->getSubExpr();
     switch (cast<CastExpr>(E)->getCastKind()) {
+    case CK_ConstructorConversion: {
+      lifetime::TypeClassification TC =
+          lifetime::classifyTypeCategory(SubExpr->getType());
+      if (TC != lifetime::TypeCategory::Pointer)
+        return nullptr;
+      LLVM_FALLTHROUGH;
+    }
     case CK_LValueToRValue:
     case CK_NoOp:
     case CK_BaseToDerived:
@@ -9383,7 +9390,6 @@ static const Expr *EvalAddr(const Expr *E,
     case CK_CPointerToObjCPointerCast:
     case CK_BlockPointerToObjCPointerCast:
     case CK_AnyPointerToBlockPointerCast:
-    case CK_ConstructorConversion:
     case CK_UserDefinedConversion:
       return EvalAddr(SubExpr, refVars, ParentDecl, OwnerOnly);
 
@@ -9415,18 +9421,20 @@ static const Expr *EvalAddr(const Expr *E,
 
   case Stmt::CXXConstructExprClass: {
     // Constructing a class with Pointer type category
-    auto skipTemp = [](const Expr *E) -> const Expr * {
-      if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(E))
-        return MTE->GetTemporaryExpr();
-      return E;
-    };
     const auto *CXXCE = cast<CXXConstructExpr>(E);
     if (CXXCE->getNumArgs() == 0)
       return nullptr;
-    if (CXXCE->getArg(0)->isLValue())
-      return EvalVal(skipTemp(CXXCE->getArg(0)), refVars, ParentDecl, true);
+    const Expr *Temp = CXXCE->getArg(0);
+    if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(CXXCE->getArg(0)))
+      Temp = MTE->GetTemporaryExpr();
+    lifetime::TypeClassification TC =
+        lifetime::classifyTypeCategory(Temp->getType());
+    if (TC != lifetime::TypeCategory::Pointer)
+      return nullptr;
+    if (Temp->isLValue())
+      return EvalVal(Temp, refVars, ParentDecl, true);
     else
-      return EvalAddr(skipTemp(CXXCE->getArg(0)), refVars, ParentDecl, true);
+      return EvalAddr(Temp, refVars, ParentDecl, true);
   }
 
   case Stmt::CXXMemberCallExprClass: {

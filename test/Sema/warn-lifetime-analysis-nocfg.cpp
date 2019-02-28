@@ -12,6 +12,8 @@ struct [[gsl::Pointer]] MyPointer {
 struct [[gsl::Owner]] T {
   operator MyPointer(); 
   int &operator*();
+  MyPointer release();
+  int *release2();
 };
 
 void f() {
@@ -23,6 +25,16 @@ void g() {
   int i;
   MyPointer p{&i}; // ok
   new MyPointer(MyPointer{p}); // ok
+}
+
+MyPointer g2() {
+  T t;
+  return t.release(); // ok
+}
+
+int *g3() {
+  T t;
+  return t.release2(); // ok
 }
 
 struct Y {

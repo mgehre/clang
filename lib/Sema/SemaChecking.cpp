@@ -9442,6 +9442,9 @@ static const Expr *EvalAddr(const Expr *E,
     const auto *CXXMCE = cast<CXXMemberCallExpr>(E);
     if (CXXMCE->getType()->isReferenceType())
       return nullptr;
+    if (const auto *CXXMD = CXXMCE->getMethodDecl())
+      if (!isa<CXXConversionDecl>(CXXMD))
+        return nullptr;
     return EvalVal(CXXMCE->getImplicitObjectArgument(), refVars, ParentDecl,
                    true);
   }

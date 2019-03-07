@@ -9442,9 +9442,14 @@ static const Expr *EvalAddr(const Expr *E,
     const auto *CXXMCE = cast<CXXMemberCallExpr>(E);
     if (CXXMCE->getType()->isReferenceType())
       return nullptr;
-    if (const auto *CXXMD = CXXMCE->getMethodDecl())
-      if (!isa<CXXConversionDecl>(CXXMD))
+    if (const auto *CXXMD = CXXMCE->getMethodDecl()) {
+      bool CanReturnDangling = false;
+      if (CXXMD->getIdentifier() &&
+          (CXXMD->getName() == "c_str" || CXXMD->getName() == "data"))
+        CanReturnDangling = true;
+      if (!isa<CXXConversionDecl>(CXXMD) && !CanReturnDangling)
         return nullptr;
+    }
     return EvalVal(CXXMCE->getImplicitObjectArgument(), refVars, ParentDecl,
                    true);
   }

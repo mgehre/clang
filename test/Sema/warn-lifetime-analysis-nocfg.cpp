@@ -14,6 +14,7 @@ struct [[gsl::Owner]] T {
   int &operator*();
   MyPointer release();
   int *release2();
+  int *c_str();
 };
 
 void f() {
@@ -35,6 +36,11 @@ MyPointer g2() {
 int *g3() {
   T t;
   return t.release2(); // ok
+}
+
+int *g4() {
+  T t;
+  return t.c_str(); // expected-warning {{address of stack memory associated with local variable 't' returned}}
 }
 
 struct Y {

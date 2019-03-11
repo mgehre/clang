@@ -9266,7 +9266,7 @@ static const Expr *EvalAddr(const Expr *E,
 
   QualType ExprType = E->getType();
   lifetime::TypeClassification TC = lifetime::classifyTypeCategory(ExprType);
-  
+
   // We should only be called for evaluating pointer expressions.
   assert((ExprType->isAnyPointerType() || ExprType->isBlockPointerType() ||
           ExprType->isObjCQualifiedIdType() ||
@@ -9450,8 +9450,8 @@ static const Expr *EvalAddr(const Expr *E,
       if (!isa<CXXConversionDecl>(CXXMD) && !CanReturnDangling)
         return nullptr;
     }
-    return EvalVal(CXXMCE->getImplicitObjectArgument(), refVars, ParentDecl,
-                   true);
+    const Expr *Obj = CXXMCE->getImplicitObjectArgument();
+    return EvalVal(Obj->IgnoreImpCasts(), refVars, ParentDecl, true);
   }
 
   // Everything else: we simply don't reason about them.

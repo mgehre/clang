@@ -3,10 +3,13 @@ struct [[gsl::Owner]] MyOwner {
   int &operator*();
 };
 
+struct T;
+
 struct [[gsl::Pointer]] MyPointer {
   MyPointer(int *p = 0);
   MyPointer(const MyOwner &);
   int &operator*();
+  T toOwner();
 };
 
 struct [[gsl::Owner]] T {
@@ -14,7 +17,7 @@ struct [[gsl::Owner]] T {
   int &operator*();
   MyPointer release();
   int *release2();
-  int *c_str();
+  int *c_str() const;
 };
 
 void f() {
@@ -41,6 +44,11 @@ int *g3() {
 int *g4() {
   T t;
   return t.c_str(); // expected-warning {{address of stack memory associated with local variable 't' returned}}
+}
+
+int *g5() {
+  MyPointer p;
+  return p.toOwner().c_str(); // expected-warning {{returning address of local temporary object}}
 }
 
 struct Y {
